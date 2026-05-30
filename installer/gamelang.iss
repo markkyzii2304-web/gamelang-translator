@@ -37,7 +37,7 @@ Name: "thai"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon";    Description: "สร้าง shortcut บน Desktop";    GroupDescription: "Shortcuts:"
-Name: "startmenuicon";  Description: "สร้าง shortcut ใน Start Menu"; GroupDescription: "Shortcuts:"; Flags: checked
+Name: "startmenuicon";  Description: "สร้าง shortcut ใน Start Menu"; GroupDescription: "Shortcuts:"
 
 [Files]
 ; bundle ทั้งโฟลเดอร์จาก PyInstaller
