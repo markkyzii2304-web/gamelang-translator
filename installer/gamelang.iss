@@ -19,9 +19,9 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
 LicenseFile=..\LICENSE.txt
-OutputDir=installer_output
+OutputDir=..\installer_output
 OutputBaseFilename=GameLang_Translator_v{#MyAppVersion}_Setup
-SetupIconFile=assets\icon.ico
+SetupIconFile=..\assets\icon.ico
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
@@ -41,7 +41,7 @@ Name: "startmenuicon";  Description: "สร้าง shortcut ใน Start Menu
 
 [Files]
 ; bundle ทั้งโฟลเดอร์จาก PyInstaller
-Source: "dist\GameLang\*"; DestDir: "{app}"; \
+Source: "..\dist\GameLang\*"; DestDir: "{app}"; \
   Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
