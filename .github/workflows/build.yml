@@ -32,19 +32,16 @@ jobs:
 
       # ── 4. สร้าง icon ─────────────────────────────────────────────────────
       - name: Create app icon
+        shell: python
         run: |
-          python - << 'EOF'
-          from PIL import Image, ImageDraw, ImageFont
+          from PIL import Image, ImageDraw
           import os
           os.makedirs("assets", exist_ok=True)
-          # สร้าง icon 256x256
           img = Image.new("RGBA", (256, 256), (9, 9, 18, 255))
           d = ImageDraw.Draw(img)
-          # พื้นหลัง gradient-like
           for i in range(256):
-            alpha = int(255 * (1 - i/256) * 0.3)
-            d.line([(0,i),(255,i)], fill=(107, 158, 255, alpha))
-          # ตัว G
+              alpha = int(255 * (1 - i/256) * 0.3)
+              d.line([(0,i),(255,i)], fill=(107, 158, 255, alpha))
           d.rounded_rectangle([20,20,236,236], radius=32,
                                fill=(20,20,50,255),
                                outline=(107,158,255,255), width=4)
@@ -53,8 +50,6 @@ jobs:
           img.save("assets/icon.ico", format="ICO",
                    sizes=[(256,256),(128,128),(64,64),(32,32),(16,16)])
           print("icon created")
-          EOF
-        shell: python
 
       # ── 5. PyInstaller — onedir ────────────────────────────────────────────
       - name: Build with PyInstaller
