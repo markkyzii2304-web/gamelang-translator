@@ -1,0 +1,156 @@
+name: Build GameLang Installer
+
+on:
+  push:
+    branches: [ main ]
+    tags:     [ 'v*' ]
+  workflow_dispatch:        # กด build ด้วยตัวเองได้จาก Actions tab
+
+jobs:
+  build-windows:
+    name: Build Windows Installer
+    runs-on: windows-latest  # ใช้ Windows VM จริง
+
+    steps:
+      # ── 1. Checkout โค้ด ───────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. ติดตั้ง Python ──────────────────────────────────────────────────
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. ติดตั้ง dependencies ────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pillow
+
+      # ── 4. สร้าง icon ─────────────────────────────────────────────────────
+      - name: Create app icon
+        run: |
+          python - << 'EOF'
+          from PIL import Image, ImageDraw, ImageFont
+          import os
+          os.makedirs("assets", exist_ok=True)
+          # สร้าง icon 256x256
+          img = Image.new("RGBA", (256, 256), (9, 9, 18, 255))
+          d = ImageDraw.Draw(img)
+          # พื้นหลัง gradient-like
+          for i in range(256):
+            alpha = int(255 * (1 - i/256) * 0.3)
+            d.line([(0,i),(255,i)], fill=(107, 158, 255, alpha))
+          # ตัว G
+          d.rounded_rectangle([20,20,236,236], radius=32,
+                               fill=(20,20,50,255),
+                               outline=(107,158,255,255), width=4)
+          d.text((72, 52), "G", fill=(107,158,255,255))
+          d.text((30, 160), "Lang", fill=(200,210,255,200))
+          img.save("assets/icon.ico", format="ICO",
+                   sizes=[(256,256),(128,128),(64,64),(32,32),(16,16)])
+          print("icon created")
+          EOF
+        shell: python
+
+      # ── 5. PyInstaller — onedir ────────────────────────────────────────────
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller `
+            --name "GameLang" `
+            --onedir `
+            --windowed `
+            --icon "assets/icon.ico" `
+            --add-data "core;core" `
+            --hidden-import PyQt6.QtWidgets `
+            --hidden-import PyQt6.QtCore `
+            --hidden-import PyQt6.QtGui `
+            --hidden-import anthropic `
+            --hidden-import requests `
+            --collect-all PyQt6 `
+            --clean `
+            --noconfirm `
+            main.py
+
+      # ── 6. ตรวจสอบว่า build สำเร็จ ────────────────────────────────────────
+      - name: Verify build
+        run: |
+          if (Test-Path "dist/GameLang/GameLang.exe") {
+            Write-Host "✓ GameLang.exe พร้อม"
+            $size = (Get-Item "dist/GameLang/GameLang.exe").Length / 1MB
+            Write-Host "  Size: $([math]::Round($size,1)) MB"
+          } else {
+            Write-Error "GameLang.exe ไม่พบ — build ล้มเหลว"
+            exit 1
+          }
+
+      # ── 7. สร้าง LICENSE.txt ───────────────────────────────────────────────
+      - name: Create LICENSE
+        run: |
+          @"
+          GameLang Translator v2.0.0
+          Copyright 2024 GameLang
+          For personal use with offline/co-op games only.
+          "@ | Out-File -FilePath LICENSE.txt -Encoding UTF8
+
+      # ── 8. ติดตั้ง Inno Setup ─────────────────────────────────────────────
+      - name: Install Inno Setup
+        run: |
+          choco install innosetup --yes --no-progress
+        shell: powershell
+
+      # ── 9. สร้าง Installer ────────────────────────────────────────────────
+      - name: Build Installer with Inno Setup
+        run: |
+          New-Item -ItemType Directory -Force -Path installer_output
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer\gamelang.iss"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Inno Setup ล้มเหลว"
+            exit 1
+          }
+          Write-Host "✓ Installer พร้อม"
+          Get-ChildItem installer_output/
+
+      # ── 10. Upload artifacts ──────────────────────────────────────────────
+      - name: Upload Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: GameLang-Installer-Windows
+          path: installer_output/GameLang_Translator_v*.exe
+          retention-days: 30
+
+      - name: Upload portable .exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: GameLang-Portable-Windows
+          path: dist/GameLang/
+          retention-days: 30
+
+      # ── 11. Release (เฉพาะตอน push tag v*) ───────────────────────────────
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer_output/GameLang_Translator_v*.exe
+          name: "GameLang Translator ${{ github.ref_name }}"
+          body: |
+            ## GameLang Translator ${{ github.ref_name }}
+
+            ### ดาวน์โหลด
+            - **GameLang_Translator_Setup.exe** — ติดตั้งแล้วใช้ได้เลย
+
+            ### ความต้องการ
+            - Windows 10 หรือใหม่กว่า
+            - API Key จาก platform.anthropic.com
+
+            ### การใช้งาน
+            1. ดาวน์โหลดและติดตั้ง Setup.exe
+            2. เปิดแอป → ใส่ API Key ใน Settings
+            3. เลือกเกมจาก Library → Scan → Translate
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
