@@ -24,6 +24,7 @@ class PatchMethod(Enum):
     BEPINEX_MOD       = "bepinex_mod"         # Unity BepInEx
     RENPY_PATCH       = "renpy_patch"         # Ren'Py .rpy translation
     RPGMAKER_PATCH    = "rpgmaker_patch"      # RPG Maker .json data
+    UE4_PAK           = "ue4_pak"             # Unreal Engine pak file modding
     OVERLAY           = "overlay"             # fallback: subtitle overlay
 
 
@@ -144,6 +145,11 @@ def _choose_method(engine: Engine,
     if engine == Engine.UNITY:
         return (PatchMethod.BEPINEX_MOD,
                 "Unity/Mono engine — ติดตั้ง BepInEx mod เพิ่มตัวเลือกภาษาไทยใน Settings")
+
+    # 3.5. Unreal Engine — pak file modding
+    if engine == Engine.UNREAL:
+        return (PatchMethod.UE4_PAK,
+                "Unreal Engine — สร้าง patch _p.pak ที่มี .locres ภาษาไทย")
 
     # 4. Has localization files → patch directly
     if loc_files:

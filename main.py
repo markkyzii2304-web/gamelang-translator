@@ -79,6 +79,7 @@ METHOD_LABELS = {
     PatchMethod.BEPINEX_MOD:       ("🔧", "BepInEx Mod",        "#4a9fff"),
     PatchMethod.RENPY_PATCH:       ("📖", "Ren'Py Translation", "#ff9f4a"),
     PatchMethod.RPGMAKER_PATCH:    ("🎮", "RPG Maker Patch",    "#ff4a9f"),
+    PatchMethod.UE4_PAK:           ("📦", "UE4 Pak Patch",      "#ff9f4a"),
     PatchMethod.OVERLAY:           ("🖥", "Overlay Layer",      "#aaaaaa"),
 }
 
@@ -556,6 +557,11 @@ _NEXT_STEPS = {
         ("1", NV_GREEN,  "เปิดเกม → ข้อความไทยจะแสดงทับหน้าจออัตโนมัติ"),
         ("ℹ", "#f0a050", "Overlay mode: ข้อความต้นฉบับยังอยู่ ไทยแสดงด้านบน"),
         ("⚠", "#888",    "ถ้า overlay ไม่แสดง ให้รัน app ในฐานะ Administrator"),
+    ],
+    PatchMethod.UE4_PAK: [
+        ("✓", NV_GREEN,  "เปิดเกมได้เลย — patch pak ถูกโหลดอัตโนมัติ"),
+        ("ℹ", NV_CYAN,   "ไฟล์ถูกสร้างใน Content/Paks/ เป็น _p.pak"),
+        ("⚠", "#f0a050", "ถ้า Steam verify files → patch ซ้ำ (glpack ยังอยู่)"),
     ],
 }
 
