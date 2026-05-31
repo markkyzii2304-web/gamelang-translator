@@ -3,7 +3,7 @@
 ; ต้องการ: Inno Setup 6+ (https://jrsoftware.org/isinfo.php)
 
 #define MyAppName      "GameLang Translator"
-#define MyAppVersion   "2.0.0"
+#define MyAppVersion   "2.0.1"
 #define MyAppPublisher "GameLang"
 #define MyAppExeName   "GameLang.exe"
 #define MyAppURL       "https://github.com/gamelang/translator"

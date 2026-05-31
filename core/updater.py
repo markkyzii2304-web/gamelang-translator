@@ -12,7 +12,16 @@ import urllib.error
 from PyQt6.QtCore import QThread, pyqtSignal
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-APP_VERSION = "2.0.0"
+import os as _os
+def _read_app_version() -> str:
+    try:
+        _here = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        with open(_os.path.join(_here, "VERSION"), "r") as f:
+            return f.read().strip()
+    except Exception:
+        return "2.0.0"
+
+APP_VERSION = _read_app_version()
 GITHUB_REPO = "markkyzii2304-web/gamelang-translator"
 API_URL     = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 TIMEOUT_S   = 8

@@ -3,7 +3,10 @@ name: Build GameLang Installer
 on:
   push:
     branches: [ main ]
-    tags:     [ 'v*' ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:        # กด build ด้วยตัวเองได้จาก Actions tab
 
 jobs:
@@ -16,21 +19,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 2. ติดตั้ง Python ──────────────────────────────────────────────────
+      # ── 2. Read version ────────────────────────────────────────────────────
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $ver = (Get-Content VERSION -Raw).Trim()
+          echo "VERSION=$ver" >> $env:GITHUB_OUTPUT
+          echo "Version: $ver"
+
+      # ── 3. ติดตั้ง Python ──────────────────────────────────────────────────
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      # ── 3. ติดตั้ง dependencies ────────────────────────────────────────────
+      # ── 4. ติดตั้ง dependencies ────────────────────────────────────────────
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller pillow
 
-      # ── 4. สร้าง icon ─────────────────────────────────────────────────────
+      # ── 5. สร้าง icon ─────────────────────────────────────────────────────
       - name: Create app icon
         shell: python
         run: |
@@ -51,7 +63,7 @@ jobs:
                    sizes=[(256,256),(128,128),(64,64),(32,32),(16,16)])
           print("icon created")
 
-      # ── 5. PyInstaller — onedir ────────────────────────────────────────────
+      # ── 6. PyInstaller — onedir ────────────────────────────────────────────
       - name: Build with PyInstaller
         run: |
           pyinstaller `
@@ -70,7 +82,7 @@ jobs:
             --noconfirm `
             main.py
 
-      # ── 6. ตรวจสอบว่า build สำเร็จ ────────────────────────────────────────
+      # ── 7. ตรวจสอบว่า build สำเร็จ ────────────────────────────────────────
       - name: Verify build
         run: |
           if (Test-Path "dist/GameLang/GameLang.exe") {
@@ -82,22 +94,30 @@ jobs:
             exit 1
           }
 
-      # ── 7. สร้าง LICENSE.txt ───────────────────────────────────────────────
+      # ── 8. สร้าง LICENSE.txt ───────────────────────────────────────────────
       - name: Create LICENSE
         run: |
           @"
-          GameLang Translator v2.0.0
+          GameLang Translator v${{ steps.version.outputs.VERSION }}
           Copyright 2024 GameLang
           For personal use with offline/co-op games only.
           "@ | Out-File -FilePath LICENSE.txt -Encoding UTF8
 
-      # ── 8. ติดตั้ง Inno Setup ─────────────────────────────────────────────
+      # ── 9. ติดตั้ง Inno Setup ─────────────────────────────────────────────
       - name: Install Inno Setup
         run: |
           choco install innosetup --yes --no-progress
         shell: powershell
 
-      # ── 9. สร้าง Installer ────────────────────────────────────────────────
+      # ── 10. Inject version into ISS ───────────────────────────────────────
+      - name: Inject version into ISS
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.version.outputs.VERSION }}"
+          (Get-Content installer/gamelang.iss) -replace '#define MyAppVersion\s+"[\d.]+"', "#define MyAppVersion   `"$ver`"" | Set-Content installer/gamelang.iss
+          echo "Injected version $ver into gamelang.iss"
+
+      # ── 11. สร้าง Installer ───────────────────────────────────────────────
       - name: Build Installer with Inno Setup
         run: |
           New-Item -ItemType Directory -Force -Path installer_output
@@ -109,7 +129,7 @@ jobs:
           Write-Host "✓ Installer พร้อม"
           Get-ChildItem installer_output/
 
-      # ── 10. Upload artifacts ──────────────────────────────────────────────
+      # ── 12. Upload artifacts ──────────────────────────────────────────────
       - name: Upload Installer
         uses: actions/upload-artifact@v4
         with:
@@ -124,27 +144,22 @@ jobs:
           path: dist/GameLang/
           retention-days: 30
 
-      # ── 11. Release (เฉพาะตอน push tag v*) ───────────────────────────────
+      # ── 13. Release (เฉพาะตอน push tag v*) ──────────────────────────────
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: installer_output/GameLang_Translator_v*.exe
-          name: "GameLang Translator ${{ github.ref_name }}"
+          name: "GameLang Translator v${{ steps.version.outputs.VERSION }}"
           body: |
-            ## GameLang Translator ${{ github.ref_name }}
+            ## GameLang Translator v${{ steps.version.outputs.VERSION }}
 
-            ### ดาวน์โหลด
-            - **GameLang_Translator_Setup.exe** — ติดตั้งแล้วใช้ได้เลย
+            ### ติดตั้ง
+            ดาวน์โหลด `GameLang_Translator_Setup.exe` แล้วรัน
 
-            ### ความต้องการ
-            - Windows 10 หรือใหม่กว่า
-            - API Key จาก platform.anthropic.com
-
-            ### การใช้งาน
-            1. ดาวน์โหลดและติดตั้ง Setup.exe
-            2. เปิดแอป → ใส่ API Key ใน Settings
-            3. เลือกเกมจาก Library → Scan → Translate
+            ### การอัปเดต
+            เปิดแอปเวอร์ชันเก่า → กดปุ่ม **↑ UPDATE** ที่ navbar
+          files: |
+            installer_output/GameLang_Translator_v${{ steps.version.outputs.VERSION }}_Setup.exe
           draft: false
           prerelease: false
         env:
