@@ -1,6 +1,6 @@
 # GameLang Translator v2
 
-> **แปลเกม offline/co-op เป็นภาษาไทยก่อนเล่น — ไม่มี lag ขณะเล่น**
+> **แปลเกม offline/co-op เป็นภาษาไทย**
 
 [![Version](https://img.shields.io/badge/version-2.0.6-blue)](https://github.com/markkyzii2304-web/gamelang-translator/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)](https://github.com/markkyzii2304-web/gamelang-translator/releases/latest)
