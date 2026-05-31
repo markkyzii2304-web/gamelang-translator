@@ -369,8 +369,20 @@ def _extract_ue4(game_dir: str, log) -> list[GameString]:
     from core import locres as locres_mod
     results: list[GameString] = []
 
-    paks_dir = os.path.join(game_dir, "Content", "Paks")
-    if not os.path.isdir(paks_dir):
+    # หา Content/Paks — ค้นตาม pattern ที่เป็นไปได้:
+    # game_dir/Content/Paks  หรือ  game_dir/<GameName>/Content/Paks
+    paks_dir = None
+    candidates = [os.path.join(game_dir, "Content", "Paks")]
+    try:
+        for sub in os.listdir(game_dir):
+            candidates.append(os.path.join(game_dir, sub, "Content", "Paks"))
+    except OSError:
+        pass
+    for c in candidates:
+        if os.path.isdir(c):
+            paks_dir = c
+            break
+    if not paks_dir:
         log("ไม่พบ Content/Paks — ไม่ใช่ UE4 game")
         return results
 

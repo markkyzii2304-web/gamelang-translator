@@ -436,7 +436,20 @@ class UE4PakPatcher:
         from core.pak_handler import list_files, extract_file, create_patch_pak
         import re
 
-        paks_dir = os.path.join(self.game_dir, "Content", "Paks")
+        paks_dir = None
+        candidates = [os.path.join(self.game_dir, "Content", "Paks")]
+        try:
+            for sub in os.listdir(self.game_dir):
+                candidates.append(os.path.join(self.game_dir, sub, "Content", "Paks"))
+        except OSError:
+            pass
+        for c in candidates:
+            if os.path.isdir(c):
+                paks_dir = c
+                break
+        if not paks_dir:
+            return "ไม่พบ Content/Paks"
+
         pak_files = [f for f in os.listdir(paks_dir)
                      if f.endswith('.pak') and '_p' not in f]
         if not pak_files:
