@@ -528,6 +528,130 @@ class UpdateDialog(QDialog):
         self.skip_btn.setEnabled(True)
 
 
+# ── Post-Patch Dialog ─────────────────────────────────────────────────────────
+_NEXT_STEPS = {
+    PatchMethod.RPGMAKER_PATCH: [
+        ("✓", NV_GREEN,  "เปิดเกมได้เลย — ข้อความในเกมเป็นภาษาไทยทันที"),
+        ("ℹ", NV_CYAN,   "ไม่ต้องเปลี่ยนภาษาในเกม เพราะแก้ไฟล์ข้อมูลโดยตรง"),
+        ("⚠", "#f0a050", "ถ้าเกมมี DLC / อัปเดตใหม่ อาจต้อง patch ซ้ำอีกครั้ง"),
+    ],
+    PatchMethod.RENPY_PATCH: [
+        ("1", NV_GREEN,  "เปิดเกม → ไปที่ <b>Preferences</b>"),
+        ("2", NV_GREEN,  "เลือก <b>Language</b> → <b>Thai</b>"),
+        ("3", NV_CYAN,   "ข้อความทั้งหมดจะเปลี่ยนเป็นภาษาไทยทันที"),
+        ("ℹ", "#888",    "ถ้าไม่เห็น Thai ให้ restart เกม 1 ครั้ง"),
+    ],
+    PatchMethod.BEPINEX_MOD: [
+        ("1", NV_GREEN,  "เปิดเกม — BepInEx mod จะโหลดอัตโนมัติ"),
+        ("2", NV_CYAN,   "ดูข้อความใน console ว่า GameLangThai โหลดสำเร็จ"),
+        ("ℹ", "#f0a050", "บางเกมอาจต้องเปิด mod ใน <b>Settings → Mods</b>"),
+        ("⚠", "#888",    "ถ้าเกมแครชให้ลอง rollback แล้วใช้ Overlay แทน"),
+    ],
+    PatchMethod.LOCALIZATION_FILE: [
+        ("✓", NV_GREEN,  "เปิดเกมได้เลย — ไฟล์ภาษาถูก replace แล้ว"),
+        ("ℹ", NV_CYAN,   "บางเกมอาจต้องเลือก Language → Thai ใน Settings"),
+        ("⚠", "#888",    "ถ้าเกม verify files → patch ซ้ำอีกครั้ง"),
+    ],
+    PatchMethod.OVERLAY: [
+        ("1", NV_GREEN,  "เปิดเกม → ข้อความไทยจะแสดงทับหน้าจออัตโนมัติ"),
+        ("ℹ", "#f0a050", "Overlay mode: ข้อความต้นฉบับยังอยู่ ไทยแสดงด้านบน"),
+        ("⚠", "#888",    "ถ้า overlay ไม่แสดง ให้รัน app ในฐานะ Administrator"),
+    ],
+}
+
+class PostPatchDialog(QDialog):
+    def __init__(self, game_name: str, method: PatchMethod,
+                 game_dir: str, string_count: int, parent=None):
+        super().__init__(parent)
+        self.game_dir = game_dir
+        self.setWindowTitle("Patch สำเร็จ ✓")
+        self.setFixedWidth(480)
+        self.setStyleSheet(
+            f"QDialog{{background:{NV_PANEL};border:1px solid #1e3a1e;}}"
+            f"QLabel{{color:{NV_TEXT};}}"
+        )
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 22, 24, 20)
+        lay.setSpacing(12)
+
+        # ── Header ──
+        hdr = QLabel("✓  PATCH สำเร็จ")
+        hdr.setStyleSheet(
+            f"color:{NV_GREEN};font-size:15px;font-weight:bold;letter-spacing:2px;"
+        )
+        lay.addWidget(hdr)
+
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setStyleSheet("color:#1e3a1e;")
+        lay.addWidget(line)
+
+        # ── Summary ──
+        icon, label, color = METHOD_LABELS.get(method, ("?","Unknown","#aaa"))
+        summary = QLabel(
+            f"<b>{game_name}</b> ถูก patch ด้วย <b>{string_count:,} strings</b><br>"
+            f"วิธี: {icon} {label}"
+        )
+        summary.setStyleSheet("font-size:13px;line-height:1.6;")
+        lay.addWidget(summary)
+
+        # ── Next steps ──
+        steps_hdr = QLabel("ขั้นตอนต่อไป")
+        steps_hdr.setStyleSheet(
+            f"color:{NV_LABEL};font-size:8px;letter-spacing:3px;font-weight:bold;margin-top:4px;"
+        )
+        lay.addWidget(steps_hdr)
+
+        steps = _NEXT_STEPS.get(method, _NEXT_STEPS[PatchMethod.LOCALIZATION_FILE])
+        for badge, color, text in steps:
+            row = QHBoxLayout()
+            row.setSpacing(10)
+
+            badge_lbl = QLabel(badge)
+            badge_lbl.setFixedSize(22, 22)
+            badge_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            badge_lbl.setStyleSheet(
+                f"background:rgba(0,0,0,0.3);border:1px solid {color};"
+                f"color:{color};font-size:10px;font-weight:bold;border-radius:2px;"
+            )
+            text_lbl = QLabel(text)
+            text_lbl.setWordWrap(True)
+            text_lbl.setStyleSheet(f"color:{NV_MUTED};font-size:12px;")
+
+            row.addWidget(badge_lbl)
+            row.addWidget(text_lbl, 1)
+            lay.addLayout(row)
+
+        # ── Buttons ──
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        folder_btn = QPushButton("📁  เปิดโฟลเดอร์เกม")
+        folder_btn.setStyleSheet(
+            f"QPushButton{{background:transparent;border:1px solid #1e2456;"
+            f"color:{NV_MUTED};padding:8px 16px;font-size:10px;letter-spacing:1px;"
+            f"font-weight:bold;border-radius:2px;}}"
+            f"QPushButton:hover{{border-color:{NV_GREEN};color:{NV_GREEN};}}"
+        )
+        folder_btn.clicked.connect(self._open_folder)
+
+        ok_btn = QPushButton("✓  รับทราบ")
+        ok_btn.clicked.connect(self.accept)
+
+        btn_row.addWidget(folder_btn)
+        btn_row.addWidget(ok_btn)
+        lay.addLayout(btn_row)
+
+    def _open_folder(self):
+        import subprocess
+        if sys.platform == "win32":
+            os.startfile(self.game_dir)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", self.game_dir])
+        else:
+            subprocess.Popen(["xdg-open", self.game_dir])
+
+
 def _md_to_simple(text: str) -> str:
     """แปลง Markdown อย่างง่ายเป็น plain text สำหรับ QLabel"""
     import re
@@ -1092,7 +1216,15 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(600, lambda: self.prog_bar.setVisible(False))
         self._update_rollback_btn()
         self._update_stats()
-        QMessageBox.information(self, "Patch สำเร็จ ✓", msg)
+
+        method = (self.detect_result.method if self.detect_result
+                  else PatchMethod.OVERLAY)
+        count  = len(self._extracted)
+        dlg = PostPatchDialog(
+            self.selected_game["name"], method,
+            self.game_dir, count, parent=self,
+        )
+        dlg.exec()
 
     # ── Rollback ──────────────────────────────────────────────────────────────
     def _on_rollback(self):
