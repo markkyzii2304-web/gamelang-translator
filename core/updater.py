@@ -12,11 +12,16 @@ import urllib.error
 from PyQt6.QtCore import QThread, pyqtSignal
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-import os as _os
+import os as _os, sys as _sys
 def _read_app_version() -> str:
     try:
-        _here = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-        with open(_os.path.join(_here, "VERSION"), "r") as f:
+        # PyInstaller frozen bundle: VERSION is in sys._MEIPASS
+        # Dev mode: VERSION is two levels up from core/updater.py
+        if getattr(_sys, 'frozen', False):
+            base = _sys._MEIPASS
+        else:
+            base = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        with open(_os.path.join(base, "VERSION"), "r") as f:
             return f.read().strip()
     except Exception:
         return "2.0.0"

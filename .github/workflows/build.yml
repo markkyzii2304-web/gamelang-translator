@@ -75,6 +75,7 @@ jobs:
             --windowed `
             --icon "assets/icon.ico" `
             --add-data "core;core" `
+            --add-data "VERSION;." `
             --hidden-import PyQt6.QtWidgets `
             --hidden-import PyQt6.QtCore `
             --hidden-import PyQt6.QtGui `
