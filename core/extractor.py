@@ -47,11 +47,23 @@ def _extract_rpgmaker(game_dir: str, log) -> list[GameString]:
     """Extract from RPG Maker JSON data files in www/data/ or data/"""
     results: list[GameString] = []
 
+    # RPG Maker MV/MZ: data may live in several paths
     data_dirs = [
         os.path.join(game_dir, "www", "data"),
         os.path.join(game_dir, "data"),
+        os.path.join(game_dir, "Game", "data"),
     ]
+    # Also search one level deeper (e.g. game_dir = steam/game → actual root inside)
+    try:
+        for entry in os.listdir(game_dir):
+            sub = os.path.join(game_dir, entry)
+            if os.path.isdir(sub):
+                data_dirs.append(os.path.join(sub, "www", "data"))
+                data_dirs.append(os.path.join(sub, "data"))
+    except Exception:
+        pass
 
+    found_data = False
     for data_dir in data_dirs:
         if not os.path.isdir(data_dir):
             continue
@@ -70,7 +82,13 @@ def _extract_rpgmaker(game_dir: str, log) -> list[GameString]:
                     log(f"  {fname}: {count} strings")
             except Exception as e:
                 log(f"  ข้าม {fname}: {e}")
+        found_data = True
         break   # ใช้แค่ dir แรกที่เจอ
+
+    # Fallback: no data dir found → broad scan
+    if not found_data:
+        log("ไม่พบ www/data — ใช้ broad scan แทน")
+        results.extend(_extract_broad(game_dir, log))
 
     log(f"RPG Maker: รวม {len(results)} strings")
     return results
@@ -216,7 +234,66 @@ def _extract_localization(game_dir: str, log) -> list[GameString]:
 def _extract_generic(game_dir: str, log) -> list[GameString]:
     """Generic fallback — scan all JSON/CSV in game dir"""
     log("Generic extraction mode...")
-    return _extract_localization(game_dir, log)
+    results = _extract_localization(game_dir, log)
+    if not results:
+        log("ไม่พบ localization folder — สแกนไฟล์ทั้งหมด...")
+        results = _extract_broad(game_dir, log)
+    return results
+
+
+_SKIP_DIRS = {
+    "__pycache__", ".git", "node_modules",
+    "audio", "sound", "music", "video", "movies",
+    "sprites", "images", "textures", "shaders",
+    "saves", "logs", "cache",
+}
+_MAX_FILE_BYTES = 8 * 1024 * 1024   # 8 MB per file
+
+
+def _extract_broad(game_dir: str, log) -> list[GameString]:
+    """
+    Broad fallback: walk ALL JSON/CSV/YAML/TXT files in game_dir (max depth 7).
+    Used when no localization-named directory is found.
+    """
+    results: list[GameString] = []
+
+    for dirpath, dirnames, files in os.walk(game_dir):
+        rel_dir = os.path.relpath(dirpath, game_dir)
+        depth   = 0 if rel_dir == "." else rel_dir.count(os.sep) + 1
+        if depth > 7:
+            dirnames.clear()
+            continue
+        # Prune heavy/irrelevant dirs
+        dirnames[:] = [d for d in dirnames
+                       if d.lower() not in _SKIP_DIRS
+                       and not d.startswith(".")]
+
+        for fname in sorted(files):
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in (".json", ".csv", ".yaml", ".yml", ".txt"):
+                continue
+            fpath = os.path.join(dirpath, fname)
+            try:
+                if os.path.getsize(fpath) > _MAX_FILE_BYTES:
+                    continue
+                rel = os.path.relpath(fpath, game_dir).replace("\\", "/")
+                before = len(results)
+                if ext == ".json":
+                    _extract_json_file(fpath, rel, results)
+                elif ext == ".csv":
+                    _extract_csv_file(fpath, rel, results)
+                elif ext in (".yaml", ".yml"):
+                    _extract_yaml_file(fpath, rel, results)
+                elif ext == ".txt":
+                    _extract_txt_file(fpath, rel, results)
+                count = len(results) - before
+                if count:
+                    log(f"  {fname}: {count} strings")
+            except Exception:
+                pass   # ข้ามไฟล์ที่อ่านไม่ได้
+
+    log(f"Broad scan: รวม {len(results)} strings")
+    return results
 
 
 # ── File-level parsers ────────────────────────────────────────────────────────
@@ -239,6 +316,32 @@ def _extract_csv_file(fpath: str, rel: str,
                         id=f"{rel}::row{i}::{col}",
                         text=val, file=rel, location=col,
                     ))
+
+
+def _extract_txt_file(fpath: str, rel: str,
+                      results: list[GameString]):
+    """Extract translatable lines from plain-text files"""
+    try:
+        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except Exception:
+        return
+    for i, line in enumerate(lines):
+        val = line.strip()
+        # Skip lines that look like code / config
+        if val.startswith(("#", "//", ";", "[", "{")):
+            continue
+        # Only take lines that are predominantly words (not key=value pairs)
+        if "=" in val:
+            # "key = value" — take the value side if translatable
+            parts = val.split("=", 1)
+            if len(parts) == 2:
+                val = parts[1].strip().strip("\"'")
+        if _is_translatable(val):
+            results.append(GameString(
+                id=f"{rel}::L{i+1}",
+                text=val, file=rel, location="text",
+            ))
 
 
 def _extract_yaml_file(fpath: str, rel: str,
