@@ -34,6 +34,8 @@ from core.font_bundle import check_and_inject
 from core.rollback import RollbackManager
 from core.extractor import extract_all, to_smart_translator_input, GameString
 from core.glpack import GLPack, GLPackWriter, GLPackReader, build_glpack, GLPACK_DIR
+from core.updater import (APP_VERSION, UpdateChecker, UpdateDownloader,
+                          launch_installer_and_quit, UpdateInfo)
 
 # ── Theme ─────────────────────────────────────────────────────────────────────
 NV_GREEN  = "#6b9eff"
@@ -366,6 +368,177 @@ class WarningDialog(QDialog):
         lay.addLayout(btn_row)
 
 
+# ── Update Dialog ─────────────────────────────────────────────────────────────
+class UpdateDialog(QDialog):
+    """แสดงข้อมูล update + ดาวน์โหลด + ติดตั้ง"""
+
+    def __init__(self, info: UpdateInfo, parent=None):
+        super().__init__(parent)
+        self.info        = info
+        self._downloader = None
+        self._installer  = ""
+
+        self.setWindowTitle(f"Update — v{info.version}")
+        self.setFixedWidth(520)
+        self.setStyleSheet(
+            f"QDialog{{background:{NV_PANEL};border:1px solid {NV_BORDER};}}"
+            f"QLabel{{color:{NV_TEXT};}}"
+            f"QProgressBar{{background:#14142a;border:1px solid #1e1e38;"
+            f"border-radius:2px;color:{NV_GREEN};text-align:center;font-size:10px;}}"
+            f"QProgressBar::chunk{{background:{NV_GREEN};}}"
+        )
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 22, 24, 20)
+        lay.setSpacing(14)
+
+        # ── Header ──
+        hdr = QLabel(f"↑  UPDATE AVAILABLE — v{info.version}")
+        hdr.setStyleSheet(
+            f"color:{NV_CYAN};font-size:14px;font-weight:bold;letter-spacing:2px;"
+        )
+        lay.addWidget(hdr)
+
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setStyleSheet(f"color:{NV_BORDER};")
+        lay.addWidget(line)
+
+        # ── Version info ──
+        size_mb = f"{info.size_bytes / 1_048_576:.1f} MB" if info.size_bytes else "—"
+        ver_lbl = QLabel(
+            f"เวอร์ชันปัจจุบัน: <b>v{APP_VERSION}</b>  →  เวอร์ชันใหม่: "
+            f"<b style='color:{NV_GREEN};'>v{info.version}</b>"
+            f"<br>ขนาดไฟล์: {size_mb}"
+        )
+        ver_lbl.setStyleSheet("font-size:13px;line-height:1.6;")
+        lay.addWidget(ver_lbl)
+
+        # ── Changelog ──
+        if info.body:
+            cl_hdr = QLabel("CHANGELOG")
+            cl_hdr.setStyleSheet(
+                f"color:{NV_LABEL};font-size:8px;letter-spacing:3px;font-weight:bold;"
+            )
+            lay.addWidget(cl_hdr)
+
+            cl_scroll = QScrollArea()
+            cl_scroll.setFixedHeight(140)
+            cl_scroll.setWidgetResizable(True)
+            cl_scroll.setStyleSheet(
+                f"QScrollArea{{background:#0d0d1e;border:1px solid #1e1e38;border-radius:2px;}}"
+            )
+            cl_lbl = QLabel(_md_to_simple(info.body))
+            cl_lbl.setWordWrap(True)
+            cl_lbl.setContentsMargins(12, 10, 12, 10)
+            cl_lbl.setStyleSheet(f"color:{NV_MUTED};font-size:11px;line-height:1.5;background:transparent;")
+            cl_scroll.setWidget(cl_lbl)
+            lay.addWidget(cl_scroll)
+
+        # ── Progress bar (ซ่อนก่อน) ──
+        self.prog_bar = QProgressBar()
+        self.prog_bar.setRange(0, 100)
+        self.prog_bar.setValue(0)
+        self.prog_bar.setFixedHeight(6)
+        self.prog_bar.setVisible(False)
+        lay.addWidget(self.prog_bar)
+
+        self.prog_lbl = QLabel("")
+        self.prog_lbl.setStyleSheet(f"color:{NV_MUTED};font-size:11px;")
+        self.prog_lbl.setVisible(False)
+        lay.addWidget(self.prog_lbl)
+
+        # ── Buttons ──
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        self.skip_btn = QPushButton("ข้ามครั้งนี้")
+        self.skip_btn.setStyleSheet(
+            "QPushButton{background:transparent;border:1px solid #1e1e38;"
+            "color:#4a5280;padding:9px 20px;font-size:11px;letter-spacing:1px;"
+            "font-weight:bold;border-radius:2px;}"
+        )
+        self.skip_btn.clicked.connect(self.reject)
+
+        self.update_btn = QPushButton("↓  ดาวน์โหลด & อัปเดต")
+        self.update_btn.clicked.connect(self._start_download)
+
+        btn_row.addWidget(self.skip_btn)
+        btn_row.addWidget(self.update_btn)
+        lay.addLayout(btn_row)
+
+    def _start_download(self):
+        if not self.info.download_url:
+            import webbrowser
+            webbrowser.open(
+                f"https://github.com/markkyzii2304-web/gamelang-translator/releases/latest"
+            )
+            return
+
+        self.update_btn.setEnabled(False)
+        self.update_btn.setText("⟳  กำลังดาวน์โหลด...")
+        self.skip_btn.setEnabled(False)
+        self.prog_bar.setVisible(True)
+        self.prog_lbl.setVisible(True)
+        self.prog_lbl.setText("กำลังเชื่อมต่อ...")
+
+        self._downloader = UpdateDownloader(
+            self.info.download_url, self.info.size_bytes
+        )
+        self._downloader.progress.connect(self._on_dl_progress)
+        self._downloader.finished.connect(self._on_dl_finished)
+        self._downloader.error.connect(self._on_dl_error)
+        self._downloader.start()
+
+    def _on_dl_progress(self, downloaded: int, total: int):
+        if total > 0:
+            pct = int(downloaded / total * 100)
+            self.prog_bar.setRange(0, 100)
+            self.prog_bar.setValue(pct)
+            mb_done  = downloaded / 1_048_576
+            mb_total = total / 1_048_576
+            self.prog_lbl.setText(
+                f"ดาวน์โหลด {mb_done:.1f} / {mb_total:.1f} MB ({pct}%)"
+            )
+        else:
+            self.prog_bar.setRange(0, 0)   # indeterminate
+            mb_done = downloaded / 1_048_576
+            self.prog_lbl.setText(f"ดาวน์โหลด {mb_done:.1f} MB...")
+
+    def _on_dl_finished(self, path: str):
+        if not path:
+            self._on_dl_error("ดาวน์โหลดล้มเหลว")
+            return
+        self._installer = path
+        self.prog_bar.setRange(0, 100)
+        self.prog_bar.setValue(100)
+        self.prog_lbl.setText("✓ ดาวน์โหลดเสร็จ — กำลังเปิด installer...")
+        self.update_btn.setText("⚙  กำลังติดตั้ง...")
+        QTimer.singleShot(800, self._run_installer)
+
+    def _run_installer(self):
+        launch_installer_and_quit(self._installer)
+
+    def _on_dl_error(self, msg: str):
+        self.prog_bar.setRange(0, 100)
+        self.prog_bar.setValue(0)
+        self.prog_lbl.setText(f"⚠ {msg}")
+        self.update_btn.setEnabled(True)
+        self.update_btn.setText("↓  ลองอีกครั้ง")
+        self.skip_btn.setEnabled(True)
+
+
+def _md_to_simple(text: str) -> str:
+    """แปลง Markdown อย่างง่ายเป็น plain text สำหรับ QLabel"""
+    import re
+    text = re.sub(r"#{1,6}\s*", "", text)          # ลบ headers
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)  # bold
+    text = re.sub(r"\*(.+?)\*",   r"\1", text)     # italic
+    text = re.sub(r"`(.+?)`",     r"\1", text)     # code
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text.strip()
+
+
 # ── Main Window ───────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -381,8 +554,10 @@ class MainWindow(QMainWindow):
         self.game_dir       = None
         self._extracted:    list[GameString] = []
         self._glpack_path:  str = ""
+        self._update_info:  UpdateInfo | None = None
 
         self._build_ui()
+        self._check_update_async()
 
     # ── Build UI ──────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -409,6 +584,24 @@ class MainWindow(QMainWindow):
         nm  = QLabel("GameLang"); nm.setStyleSheet("color:#e0e8d8;font-size:13px;font-weight:800;")
         sub = QLabel("TRANSLATOR"); sub.setStyleSheet(f"color:{NV_LABEL};font-size:9px;letter-spacing:2px;")
         lay.addWidget(logo); lay.addWidget(nm); lay.addWidget(sub); lay.addStretch()
+
+        # Version label
+        ver_lbl = QLabel(f"v{APP_VERSION}")
+        ver_lbl.setStyleSheet(f"color:{NV_LABEL};font-size:9px;letter-spacing:1px;")
+        lay.addWidget(ver_lbl)
+
+        # Update button (hidden until update found)
+        self._update_btn = QPushButton("↑  UPDATE")
+        self._update_btn.setFixedHeight(28)
+        self._update_btn.setStyleSheet(
+            f"QPushButton{{background:rgba(56,189,248,0.1);border:1px solid {NV_CYAN};"
+            f"color:{NV_CYAN};border-radius:2px;font-size:9px;letter-spacing:2px;"
+            f"font-weight:bold;padding:4px 12px;}}"
+            f"QPushButton:hover{{background:rgba(56,189,248,0.25);}}"
+        )
+        self._update_btn.setVisible(False)
+        self._update_btn.clicked.connect(self._on_update_click)
+        lay.addWidget(self._update_btn)
 
         set_btn = QPushButton("⚙"); set_btn.setFixedSize(34,34)
         set_btn.clicked.connect(self._open_settings); lay.addWidget(set_btn)
@@ -978,6 +1171,27 @@ class MainWindow(QMainWindow):
         gl.addWidget(rb_th); gl.addWidget(more); lay.addWidget(gb)
         ok = QPushButton("✓  บันทึก"); ok.clicked.connect(dlg.accept)
         lay.addWidget(ok); dlg.exec()
+
+    # ── Auto-update ───────────────────────────────────────────────────────────
+    def _check_update_async(self):
+        """ตรวจสอบ update ใน background ตอนเปิด app"""
+        if not HAS_REQUESTS:
+            return
+        w = UpdateChecker()
+        w.update_available.connect(self._on_update_found)
+        w.start()
+        self._update_checker = w   # เก็บไว้ไม่ให้ GC เก็บ
+
+    def _on_update_found(self, info: UpdateInfo):
+        self._update_info = info
+        self._update_btn.setText(f"↑  UPDATE v{info.version}")
+        self._update_btn.setVisible(True)
+
+    def _on_update_click(self):
+        if not self._update_info:
+            return
+        dlg = UpdateDialog(self._update_info, parent=self)
+        dlg.exec()
 
     # ── Utility ───────────────────────────────────────────────────────────────
     def _find_steam_dir(self, name):
