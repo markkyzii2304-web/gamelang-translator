@@ -42,18 +42,176 @@ def extract_all(game_dir: str, engine: str,
         return _extract_generic(game_dir, log)
 
 
+# ── RPG Maker MV/MZ helpers ───────────────────────────────────────────────────
+
+def _read_json(fpath):
+    """Try multiple encodings to read a JSON file; return parsed data or None."""
+    for enc in ("utf-8-sig", "utf-8", "gbk", "gb18030", "latin-1"):
+        try:
+            with open(fpath, "r", encoding=enc) as f:
+                return json.load(f)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+    return None
+
+
+def _walk_event_list(lst, rel, results, location, map_name=""):
+    """Walk RPGMaker event command list, extract dialogue by code."""
+    if not isinstance(lst, list):
+        return
+    for idx, cmd in enumerate(lst):
+        if not isinstance(cmd, dict):
+            continue
+        code   = cmd.get("code", 0)
+        params = cmd.get("parameters", [])
+
+        if code == 401 and params:           # Show Text (dialogue line)
+            text = params[0]
+            if isinstance(text, str) and _is_translatable(text):
+                results.append(GameString(
+                    id=f"{rel}::ev{idx}",
+                    text=text, file=rel,
+                    location=location,
+                    speaker=None,
+                ))
+        elif code == 101 and len(params) >= 5:  # Show Text header (speaker name)
+            name = params[4]
+            if isinstance(name, str) and _is_translatable(name):
+                results.append(GameString(
+                    id=f"{rel}::sp{idx}",
+                    text=name, file=rel,
+                    location=location,
+                    speaker=name,
+                ))
+        elif code == 102 and params:         # Show Choices
+            choices = params[0]
+            if isinstance(choices, list):
+                for ci, choice in enumerate(choices):
+                    if isinstance(choice, str) and _is_translatable(choice):
+                        results.append(GameString(
+                            id=f"{rel}::ch{idx}_{ci}",
+                            text=choice, file=rel,
+                            location=location,
+                        ))
+        elif code == 405 and params:         # Show Scrolling Text
+            text = params[0]
+            if isinstance(text, str) and _is_translatable(text):
+                results.append(GameString(
+                    id=f"{rel}::sc{idx}",
+                    text=text, file=rel,
+                    location=location,
+                ))
+
+
+def _extract_rpg_obj_fields(obj, rel, results, location, fields):
+    """Extract specific text fields from an RPGMaker data object."""
+    if not isinstance(obj, dict):
+        return
+    for field in fields:
+        val = obj.get(field)
+        if isinstance(val, str) and _is_translatable(val):
+            oid = obj.get("id", 0)
+            results.append(GameString(
+                id=f"{rel}::{field}_{oid}",
+                text=val, file=rel,
+                location=location,
+            ))
+
+
+def _extract_rpgmaker_data(data_dir: str, game_dir: str, log, results):
+    """Parse each RPGMaker data file by type."""
+    MAP_FIELDS    = ["name"]
+    ACTOR_FIELDS  = ["name", "profile", "nickname"]
+    ITEM_FIELDS   = ["name", "description"]
+    ENEMY_FIELDS  = ["name"]
+    CLASS_FIELDS  = ["name"]
+
+    files = sorted(f for f in os.listdir(data_dir) if f.endswith(".json"))
+    for fname in files:
+        fpath  = os.path.join(data_dir, fname)
+        rel    = os.path.relpath(fpath, game_dir).replace("\\", "/")
+        fl     = fname.lower()
+        before = len(results)
+
+        data = _read_json(fpath)
+        if data is None:
+            log(f"  skip {fname} (unreadable)")
+            continue
+
+        try:
+            if fl.startswith("map") and fl != "mapinfos.json":
+                # Map file — walk events
+                loc = f"map_{fname.replace('.json', '')}"
+                for event in (data.get("events") or []):
+                    if not isinstance(event, dict):
+                        continue
+                    for page in (event.get("pages") or []):
+                        _walk_event_list(
+                            page.get("list", []), rel, results, loc
+                        )
+                # Also extract display name
+                _extract_rpg_obj_fields(data, rel, results, loc, ["displayName"])
+
+            elif fl == "commonevents.json":
+                for ev in (data if isinstance(data, list) else []):
+                    if not isinstance(ev, dict):
+                        continue
+                    _walk_event_list(ev.get("list", []), rel, results, "common_event")
+                    _extract_rpg_obj_fields(ev, rel, results, "common_event", ["name"])
+
+            elif fl == "actors.json":
+                for obj in (data if isinstance(data, list) else []):
+                    _extract_rpg_obj_fields(obj, rel, results, "character", ACTOR_FIELDS)
+
+            elif fl in ("items.json", "weapons.json", "armors.json", "skills.json", "states.json"):
+                loc = fl.replace(".json", "")
+                for obj in (data if isinstance(data, list) else []):
+                    _extract_rpg_obj_fields(obj, rel, results, loc, ITEM_FIELDS)
+
+            elif fl in ("enemies.json", "classes.json", "troops.json"):
+                loc = fl.replace(".json", "")
+                for obj in (data if isinstance(data, list) else []):
+                    _extract_rpg_obj_fields(obj, rel, results, loc, ENEMY_FIELDS)
+
+            elif fl == "system.json":
+                title = data.get("gameTitle", "")
+                if _is_translatable(title):
+                    results.append(GameString(id=f"{rel}::gameTitle",
+                        text=title, file=rel, location="ui"))
+                terms = data.get("terms", {})
+                for section in ("messages", ):
+                    for k, v in (terms.get(section) or {}).items():
+                        if isinstance(v, str) and _is_translatable(v):
+                            results.append(GameString(id=f"{rel}::terms.{k}",
+                                text=v, file=rel, location="ui"))
+                for section in ("commands", "params", "etypes", "wtypes"):
+                    for i, v in enumerate(terms.get(section) or []):
+                        if isinstance(v, str) and _is_translatable(v):
+                            results.append(GameString(id=f"{rel}::terms.{section}[{i}]",
+                                text=v, file=rel, location="ui"))
+
+            elif fl == "mapinfos.json":
+                for obj in (data if isinstance(data, list) else []):
+                    _extract_rpg_obj_fields(obj, rel, results, "map_info", ["name"])
+
+        except Exception as e:
+            log(f"  warning {fname}: {e}")
+
+        count = len(results) - before
+        if count:
+            log(f"  {fname}: {count} strings")
+
+
 # ── RPG Maker MV/MZ ───────────────────────────────────────────────────────────
 def _extract_rpgmaker(game_dir: str, log) -> list[GameString]:
-    """Extract from RPG Maker JSON data files in www/data/ or data/"""
     results: list[GameString] = []
 
-    # RPG Maker MV/MZ: data may live in several paths
     data_dirs = [
         os.path.join(game_dir, "www", "data"),
         os.path.join(game_dir, "data"),
         os.path.join(game_dir, "Game", "data"),
     ]
-    # Also search one level deeper (e.g. game_dir = steam/game → actual root inside)
+    # Search one level deeper
     try:
         for entry in os.listdir(game_dir):
             sub = os.path.join(game_dir, entry)
@@ -63,49 +221,21 @@ def _extract_rpgmaker(game_dir: str, log) -> list[GameString]:
     except Exception:
         pass
 
-    found_data = False
+    found = False
     for data_dir in data_dirs:
         if not os.path.isdir(data_dir):
             continue
-        files = sorted(f for f in os.listdir(data_dir) if f.endswith(".json"))
-        for fname in files:
-            fpath = os.path.join(data_dir, fname)
-            rel   = os.path.relpath(fpath, game_dir).replace("\\", "/")
-            try:
-                with open(fpath, "r", encoding="utf-8-sig") as f:
-                    data = json.load(f)
-                before = len(results)
-                _walk_json(data, fname.replace(".json", ""), rel,
-                           results, _guess_rpg_location(fname))
-                count = len(results) - before
-                if count:
-                    log(f"  {fname}: {count} strings")
-            except Exception as e:
-                log(f"  ข้าม {fname}: {e}")
-        found_data = True
-        break   # ใช้แค่ dir แรกที่เจอ
+        log(f"RPGMaker data: {data_dir}")
+        _extract_rpgmaker_data(data_dir, game_dir, log, results)
+        found = True
+        break
 
-    # Fallback: no data dir found → broad scan
-    if not found_data:
-        log("ไม่พบ www/data — ใช้ broad scan แทน")
+    if not found:
+        log("no www/data found — falling back to broad scan")
         results.extend(_extract_broad(game_dir, log))
 
-    log(f"RPG Maker: รวม {len(results)} strings")
+    log(f"RPG Maker: total {len(results)} strings")
     return results
-
-
-def _guess_rpg_location(fname: str) -> str:
-    f = fname.lower()
-    if "map" in f:          return "map"
-    if "actor" in f:        return "character"
-    if "common" in f:       return "dialogue"
-    if "item" in f or "weapon" in f or "armor" in f: return "item"
-    if "skill" in f:        return "skill"
-    if "system" in f:       return "ui"
-    if "enemy" in f:        return "enemy"
-    if "state" in f:        return "status"
-    if "class" in f:        return "class"
-    return "unknown"
 
 
 # ── Ren'Py ────────────────────────────────────────────────────────────────────
@@ -132,9 +262,9 @@ def _extract_renpy(game_dir: str, log) -> list[GameString]:
                 if count:
                     log(f"  {fname}: {count} strings")
             except Exception as e:
-                log(f"  ข้าม {fname}: {e}")
+                log(f"  skip {fname}: {e}")
 
-    log(f"Ren'Py: รวม {len(results)} strings")
+    log(f"Ren'Py: total {len(results)} strings")
     return results
 
 
@@ -225,9 +355,9 @@ def _extract_localization(game_dir: str, log) -> list[GameString]:
             if count:
                 log(f"  {os.path.basename(fpath)}: {count} strings")
         except Exception as e:
-            log(f"  ข้าม {os.path.basename(fpath)}: {e}")
+            log(f"  skip {os.path.basename(fpath)}: {e}")
 
-    log(f"Localization: รวม {len(results)} strings")
+    log(f"Localization: total {len(results)} strings")
     return results
 
 
@@ -236,7 +366,7 @@ def _extract_generic(game_dir: str, log) -> list[GameString]:
     log("Generic extraction mode...")
     results = _extract_localization(game_dir, log)
     if not results:
-        log("ไม่พบ localization folder — สแกนไฟล์ทั้งหมด...")
+        log("no localization folder found — scanning all files...")
         results = _extract_broad(game_dir, log)
     return results
 
@@ -290,9 +420,9 @@ def _extract_broad(game_dir: str, log) -> list[GameString]:
                 if count:
                     log(f"  {fname}: {count} strings")
             except Exception:
-                pass   # ข้ามไฟล์ที่อ่านไม่ได้
+                pass   # skip unreadable files
 
-    log(f"Broad scan: รวม {len(results)} strings")
+    log(f"Broad scan: total {len(results)} strings")
     return results
 
 
@@ -365,7 +495,7 @@ def _walk_json(obj, path: str, rel: str,
                results: list[GameString],
                default_location: str, depth: int = 0):
     """Recursively walk JSON and collect translatable strings"""
-    if depth > 12:   # RPGMaker MV/MZ events nest ลึกถึง 8-10 ระดับ
+    if depth > 12:   # RPGMaker MV/MZ events nest up to 8-10 levels
         return
     if isinstance(obj, str):
         if _is_translatable(obj):
@@ -401,7 +531,7 @@ def _path_to_location(path: str, default: str) -> str:
 def _is_translatable(text: str) -> bool:
     """
     Return True if this string should be translated.
-    รองรับข้อความ: อังกฤษ (Latin), จีน/ญี่ปุ่น (CJK), เกาหลี (Hangul)
+    Supports: English (Latin), Chinese/Japanese (CJK), Korean (Hangul)
     """
     t = text.strip()
     if not t or len(t) < 2:
@@ -418,19 +548,24 @@ def _is_translatable(text: str) -> bool:
     # Skip if already contains Thai characters
     if re.search(r'[฀-๿]', t):
         return False
-    # ต้องมีตัวอักษรที่มีความหมายอย่างน้อย 1 กลุ่ม:
-    # - Latin (อังกฤษ)
+    # Must have at least one meaningful character group:
+    # - Latin (English)
     has_latin  = bool(re.search(r'[a-zA-Z]', t))
-    # - CJK (จีนกลาง / ญี่ปุ่น kanji / จีนตัวย่อ-ตัวเต็ม)
-    has_cjk    = bool(re.search(r'[一-鿿㐀-䶿'
-                                 r'豈-﫿぀-ヿ]', t))
-    # - Hangul (เกาหลี)
+    # - CJK (Chinese / Japanese kanji / Simplified+Traditional)
+    has_cjk    = bool(re.search(
+        r'[一-鿿'    # CJK Unified Ideographs
+        r'㐀-䶿'     # CJK Extension A
+        r'぀-ヿ'     # Hiragana + Katakana
+        r'豈-﫿]',   # CJK Compatibility
+        t
+    ))
+    # - Hangul (Korean)
     has_hangul = bool(re.search(r'[가-힯ᄀ-ᇿ]', t))
 
     if not (has_latin or has_cjk or has_hangul):
         return False
 
-    # ข้อความ Latin สั้นมาก (1-2 ตัว) ที่ไม่ใช่คำ → ข้าม
+    # Very short Latin text (1-2 chars) that is not a word → skip
     if has_latin and not has_cjk and not has_hangul:
         if len(t) <= 2 and not re.search(r'[a-z]{2}', t, re.IGNORECASE):
             return False
