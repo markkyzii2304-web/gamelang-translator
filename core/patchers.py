@@ -448,8 +448,9 @@ class UE4PakPatcher:
         # Group glpack entries by locres file
         file_map: dict[str, dict[str, dict[str, str]]] = {}
         for entry in self.glpack.strings.values():
-            # entry.file format: "path/to/en/UI.locres"
-            th_file = re.sub(r'/(en|zh-Hans|zh-CN|zh-Hant)/', '/th/', entry.file)
+            # เขียนไปที่ /en/ locale เพราะ Wandering Sword (และ UE4 games ที่ใช้ scheme นี้)
+            # อ่าน en/ locale เพื่อแสดงภาษาไทย (อ้างอิงจาก example patch pak)
+            th_file = re.sub(r'/(zh-Hans|zh-CN|zh-Hant)/', '/en/', entry.file)
             parts = entry.id.split('::')
             if len(parts) >= 3:
                 ns  = parts[1]
