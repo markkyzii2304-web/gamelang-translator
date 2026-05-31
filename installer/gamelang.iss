@@ -56,10 +56,10 @@ Root: HKCU; Subkey: "Software\GameLang"; Flags: uninsdeletekeyifempty
 Root: HKCU; Subkey: "Software\GameLang\Translator"; Flags: uninsdeletekey
 
 [Run]
-; เปิดแอปหลังติดตั้ง
+; เปิดแอปหลังติดตั้ง (รวมถึงตอน silent update)
 Filename: "{app}\{#MyAppExeName}"; \
   Description: "เปิด {#MyAppName}"; \
-  Flags: nowait postinstall skipifsilent
+  Flags: nowait postinstall
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"

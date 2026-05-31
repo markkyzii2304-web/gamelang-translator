@@ -157,7 +157,8 @@ def launch_installer_and_quit(installer_path: str):
     try:
         # /SILENT = ไม่ถาม / CLOSEAPPLICATIONS = ปิด process เก่า
         subprocess.Popen(
-            [installer_path, "/SILENT", "/CLOSEAPPLICATIONS"],
+            [installer_path, "/VERYSILENT", "/CLOSEAPPLICATIONS",
+             "/RESTARTAPPLICATIONS", "/NORESTART"],
             close_fds=True,
         )
     except Exception:
