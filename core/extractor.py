@@ -365,7 +365,7 @@ def _walk_json(obj, path: str, rel: str,
                results: list[GameString],
                default_location: str, depth: int = 0):
     """Recursively walk JSON and collect translatable strings"""
-    if depth > 8:
+    if depth > 12:   # RPGMaker MV/MZ events nest ลึกถึง 8-10 ระดับ
         return
     if isinstance(obj, str):
         if _is_translatable(obj):
@@ -399,28 +399,42 @@ def _path_to_location(path: str, default: str) -> str:
 
 # ── Filter ────────────────────────────────────────────────────────────────────
 def _is_translatable(text: str) -> bool:
-    """Return True if this string should be translated"""
+    """
+    Return True if this string should be translated.
+    รองรับข้อความ: อังกฤษ (Latin), จีน/ญี่ปุ่น (CJK), เกาหลี (Hangul)
+    """
     t = text.strip()
     if not t or len(t) < 2:
         return False
     # Pure numbers / symbols
-    if re.match(r'^[\d\s\.\,\-\+\%\:\/#@!*()_=]+$', t):
+    if re.match(r'^[\d\s\.\,\-\+\%\:\/#@!*()_=\[\]{}|\\<>^~]+$', t):
         return False
     # File paths or URLs
     if re.match(r'^(https?://|www\.|[A-Za-z]:[/\\]|\.{1,2}[/\\])', t):
         return False
-    # Control codes / hex
+    # Control codes / hex / escape sequences
     if re.match(r'^\\[a-zA-Z]|\\\{|0x[0-9a-fA-F]', t):
-        return False
-    # Must contain at least one Latin letter
-    if not re.search(r'[a-zA-Z]', t):
         return False
     # Skip if already contains Thai characters
     if re.search(r'[฀-๿]', t):
         return False
-    # Skip single-letter codes
-    if len(t) <= 2 and not re.search(r'[a-z]{2}', t, re.IGNORECASE):
+    # ต้องมีตัวอักษรที่มีความหมายอย่างน้อย 1 กลุ่ม:
+    # - Latin (อังกฤษ)
+    has_latin  = bool(re.search(r'[a-zA-Z]', t))
+    # - CJK (จีนกลาง / ญี่ปุ่น kanji / จีนตัวย่อ-ตัวเต็ม)
+    has_cjk    = bool(re.search(r'[一-鿿㐀-䶿'
+                                 r'豈-﫿぀-ヿ]', t))
+    # - Hangul (เกาหลี)
+    has_hangul = bool(re.search(r'[가-힯ᄀ-ᇿ]', t))
+
+    if not (has_latin or has_cjk or has_hangul):
         return False
+
+    # ข้อความ Latin สั้นมาก (1-2 ตัว) ที่ไม่ใช่คำ → ข้าม
+    if has_latin and not has_cjk and not has_hangul:
+        if len(t) <= 2 and not re.search(r'[a-z]{2}', t, re.IGNORECASE):
+            return False
+
     return True
 
 
