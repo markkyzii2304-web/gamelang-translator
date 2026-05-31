@@ -720,16 +720,29 @@ class MainWindow(QMainWindow):
         ver_lbl.setStyleSheet(f"color:{NV_LABEL};font-size:9px;letter-spacing:1px;")
         lay.addWidget(ver_lbl)
 
-        # Update button (hidden until update found)
-        self._update_btn = QPushButton("↑  UPDATE")
+        # Update button — always visible, state changes based on check result
+        self._update_btn = QPushButton("⟳  ตรวจสอบ...")
         self._update_btn.setFixedHeight(28)
-        self._update_btn.setStyleSheet(
+        self._update_btn.setEnabled(False)   # disabled while checking
+        self._update_btn_style_checking = (
+            f"QPushButton{{background:transparent;border:1px solid #1e2456;"
+            f"color:{NV_MUTED};border-radius:2px;font-size:9px;letter-spacing:1px;"
+            f"font-weight:bold;padding:4px 12px;}}"
+        )
+        self._update_btn_style_ok = (
+            f"QPushButton{{background:transparent;border:1px solid #1e2456;"
+            f"color:{NV_LABEL};border-radius:2px;font-size:9px;letter-spacing:1px;"
+            f"font-weight:bold;padding:4px 12px;}}"
+            f"QPushButton:enabled:hover{{border-color:{NV_MUTED};color:{NV_MUTED};}}"
+        )
+        self._update_btn_style_new = (
             f"QPushButton{{background:rgba(56,189,248,0.1);border:1px solid {NV_CYAN};"
             f"color:{NV_CYAN};border-radius:2px;font-size:9px;letter-spacing:2px;"
             f"font-weight:bold;padding:4px 12px;}}"
-            f"QPushButton:hover{{background:rgba(56,189,248,0.25);}}"
+            f"QPushButton:enabled:hover{{background:rgba(56,189,248,0.25);}}"
         )
-        self._update_btn.setVisible(False)
+        self._update_btn.setStyleSheet(self._update_btn_style_checking)
+        self._update_btn.setVisible(True)
         self._update_btn.clicked.connect(self._on_update_click)
         lay.addWidget(self._update_btn)
 
@@ -1313,23 +1326,41 @@ class MainWindow(QMainWindow):
     # ── Auto-update ───────────────────────────────────────────────────────────
     def _check_update_async(self):
         """ตรวจสอบ update ใน background ตอนเปิด app"""
+        self._update_btn.setText("⟳  ตรวจสอบ...")
+        self._update_btn.setEnabled(False)
+        self._update_btn.setStyleSheet(self._update_btn_style_checking)
+
         if not HAS_REQUESTS:
+            self._update_btn.setText(f"v{APP_VERSION}")
+            self._update_btn.setEnabled(False)
             return
+
         w = UpdateChecker()
         w.update_available.connect(self._on_update_found)
+        w.up_to_date.connect(self._on_up_to_date)
         w.start()
         self._update_checker = w   # เก็บไว้ไม่ให้ GC เก็บ
 
     def _on_update_found(self, info: UpdateInfo):
         self._update_info = info
         self._update_btn.setText(f"↑  UPDATE v{info.version}")
-        self._update_btn.setVisible(True)
+        self._update_btn.setEnabled(True)
+        self._update_btn.setStyleSheet(self._update_btn_style_new)
+
+    def _on_up_to_date(self):
+        """เวอร์ชันล่าสุดแล้ว — แสดงปุ่มสีเทาพร้อม re-check เมื่อคลิก"""
+        self._update_btn.setText(f"✓  v{APP_VERSION}  (ล่าสุด)")
+        self._update_btn.setEnabled(True)
+        self._update_btn.setStyleSheet(self._update_btn_style_ok)
 
     def _on_update_click(self):
-        if not self._update_info:
-            return
-        dlg = UpdateDialog(self._update_info, parent=self)
-        dlg.exec()
+        if self._update_info:
+            dlg = UpdateDialog(self._update_info, parent=self)
+            dlg.exec()
+        else:
+            # Re-check manually
+            self._update_info = None
+            self._check_update_async()
 
     # ── Utility ───────────────────────────────────────────────────────────────
     def _find_steam_dir(self, name):
