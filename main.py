@@ -13,9 +13,11 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QStackedWidget,
     QDialog, QScrollArea, QFrame, QFileDialog, QMessageBox, QProgressBar,
+    QSizeGrip, QLineEdit,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
-from PyQt6.QtGui import QPixmap, QColor, QPalette, QIcon
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QRectF
+from PyQt6.QtGui import (QPixmap, QColor, QPalette, QIcon,
+                          QPainter, QLinearGradient, QFont, QPen)
 
 try:
     import requests
@@ -29,13 +31,36 @@ try:
 except ImportError:
     HAS_ANTHROPIC = False
 
-from core.engine_detector import detect, PatchMethod, Engine
+from core.engine_detector import detect, PatchMethod, Engine, DetectionResult
 from core.font_bundle import check_and_inject
 from core.rollback import RollbackManager
 from core.extractor import extract_all, to_smart_translator_input, GameString
-from core.glpack import GLPack, GLPackWriter, GLPackReader, build_glpack, GLPACK_DIR
+from core.glpack import (GLPack, GLPackWriter, GLPackReader,
+                          build_glpack, merge_glpacks,
+                          GLPackCheckpoint, GLPACK_DIR,
+                          CHECKPOINT_EVERY)
 from core.updater import (APP_VERSION, UpdateChecker, UpdateDownloader,
                           launch_installer_and_quit, UpdateInfo)
+from core.pack_store import (PackFetchWorker, PackDownloadWorker,
+                              find_pack, size_str, PackInfo)
+from core.library import (load_library, save_library,
+                           add_game, remove_game, make_entry)
+from core.pack_uploader import PackUploadWorker
+
+# ── Config helpers (GitHub token) ─────────────────────────────────────────────
+_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".gamelang", "config.json")
+
+def _load_config() -> dict:
+    try:
+        with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_config(data: dict):
+    os.makedirs(os.path.dirname(_CONFIG_PATH), exist_ok=True)
+    with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 # ── Theme ─────────────────────────────────────────────────────────────────────
 NV_GREEN  = "#6b9eff"
@@ -52,6 +77,7 @@ NV_PURPLE = "#a78bfa"
 STYLESHEET = f"""
 QMainWindow, QWidget {{ background:{NV_BG}; color:{NV_TEXT};
   font-family:'Segoe UI',sans-serif; font-size:13px; }}
+QWidget#mainRoot {{ border:1px solid #1e1e3a; }}
 QLabel {{ color:{NV_TEXT}; }}
 QPushButton {{
   background:transparent; border:1px solid #1e1e38; color:#4a5280;
@@ -83,16 +109,17 @@ METHOD_LABELS = {
     PatchMethod.OVERLAY:           ("🖥", "Overlay Layer",      "#aaaaaa"),
 }
 
-MOCK_GAMES = [
-    {"appid": 1876890, "name": "Wandering Sword"},
-    {"appid": 1245620, "name": "Elden Ring"},
-    {"appid": 1091500, "name": "Cyberpunk 2077"},
-    {"appid":  814380, "name": "Sekiro"},
-    {"appid":     570, "name": "Dota 2"},
-    {"appid":  292030, "name": "The Witcher 3"},
-    {"appid": 1145360, "name": "Hades"},
-    {"appid":  413150, "name": "Stardew Valley"},
-]
+# Steam App ID lookup (ใช้โหลด artwork เท่านั้น — ไม่ได้ populate sidebar แล้ว)
+KNOWN_APPIDS: dict[str, int] = {
+    "Wandering Sword": 1876890,
+    "Elden Ring":      1245620,
+    "Cyberpunk 2077":  1091500,
+    "Sekiro":           814380,
+    "Dota 2":               570,
+    "The Witcher 3":    292030,
+    "Hades":           1145360,
+    "Stardew Valley":   413150,
+}
 
 
 # ── Workers ───────────────────────────────────────────────────────────────────
@@ -159,40 +186,60 @@ class ExtractWorker(QThread):
 
 
 class TranslateAllWorker(QThread):
-    """Translate all extracted strings in batches, emit progress"""
+    """
+    แปล strings ทั้งหมดแบบ batch + emit progress
+    รองรับ checkpoint resume: ถ้ามี existing_pack จะ merge ตอนสิ้นสุด
+    """
     tick     = pyqtSignal(int, int, str)   # current, total, message
     finished = pyqtSignal(str)             # glpack_path  (empty = failed)
 
     def __init__(self, game_name: str, engine: str,
                  strings: list[GameString],
-                 game_context: dict):
+                 game_context: dict,
+                 existing_pack: "GLPack | None" = None,
+                 start_offset: int = 0):
         super().__init__()
-        self.game_name    = game_name
-        self.engine       = engine
-        self.strings      = strings
-        self.game_context = game_context
+        self.game_name     = game_name
+        self.engine        = engine
+        self.strings       = strings       # เฉพาะ strings ที่ยังไม่ได้แปล
+        self.game_context  = game_context
+        self.existing_pack = existing_pack  # checkpoint ที่โหลดมา (หรือ None)
+        self.start_offset  = start_offset   # จำนวนที่แปลไปแล้ว (จาก checkpoint)
 
     def run(self):
-        total = len(self.strings)
+        total   = len(self.strings)
+        game_id = self.game_name.lower().replace(" ", "_")
+
+        # กรณีพิเศษ: ทุก string แปลแล้วใน checkpoint (resume ที่ครบ)
         if total == 0:
-            self.finished.emit("")
+            if self.existing_pack:
+                save_path = self.existing_pack.pack_path()
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                GLPackWriter.save(save_path, self.existing_pack)
+                GLPackCheckpoint.clear(game_id)
+                n = len(self.existing_pack.strings)
+                self.tick.emit(n, n, f"✓ ครบแล้ว — {n:,} strings (จาก checkpoint)")
+                self.finished.emit(save_path)
+            else:
+                self.finished.emit("")
             return
 
         try:
             from core.translation_memory import SmartTranslator
             translator = SmartTranslator(
-                game_id      = self.game_name.lower().replace(" ", "_"),
+                game_id      = game_id,
                 game_context = self.game_context,
                 speaker_roles= {},
             )
         except Exception as e:
-            self.tick.emit(0, total, f"⚠ SmartTranslator error: {e}")
+            self.tick.emit(0, self.start_offset + total,
+                           f"⚠ SmartTranslator error: {e}")
             self.finished.emit("")
             return
 
-        CHUNK = 50
+        CHUNK   = 50
         results: list[str] = []
-        done = 0
+        done    = 0
 
         for start in range(0, total, CHUNK):
             chunk   = self.strings[start:start + CHUNK]
@@ -200,33 +247,53 @@ class TranslateAllWorker(QThread):
             try:
                 chunk_results = translator.process_batch(payload)
                 results.extend(chunk_results)
-            except Exception as e:
-                # Fallback: keep original text
-                results.extend([s.text for s in chunk])
+            except Exception:
+                results.extend([s.text for s in chunk])   # fallback
 
             done += len(chunk)
-            pct  = int(done / total * 100)
-            spk  = chunk[0].speaker or ""
-            loc  = chunk[0].location or ""
-            msg  = (f"กำลังแปล {done:,} / {total:,} strings ({pct}%)"
-                    + (f" — {spk}" if spk else "")
-                    + (f" [{loc}]" if loc else ""))
-            self.tick.emit(done, total, msg)
 
-        # Save .glpack
+            # ── Checkpoint ทุก CHECKPOINT_EVERY strings ─────────────────
+            if done % CHECKPOINT_EVERY < CHUNK:
+                try:
+                    partial = build_glpack(self.game_name, self.engine,
+                                           self.strings[:done], results)
+                    if self.existing_pack:
+                        partial = merge_glpacks(self.existing_pack, partial)
+                    GLPackCheckpoint.save(partial)
+                except Exception:
+                    pass
+
+            # ── Progress signal (รวม start_offset) ───────────────────────
+            done_total = self.start_offset + done
+            total_all  = self.start_offset + total
+            pct        = int(done_total / total_all * 100)
+            spk        = chunk[0].speaker or ""
+            loc        = chunk[0].location or ""
+            resume_tag = " ▶resume" if self.start_offset else ""
+            msg = (f"กำลังแปล {done_total:,} / {total_all:,} strings"
+                   f" ({pct}%){resume_tag}"
+                   + (f" — {spk}" if spk else "")
+                   + (f" [{loc}]" if loc else ""))
+            self.tick.emit(done_total, total_all, msg)
+
+        # ── สร้าง final pack ─────────────────────────────────────────────
         try:
-            pack = build_glpack(
-                self.game_name, self.engine,
-                self.strings, results,
-            )
-            save_path = pack.pack_path()
+            new_pack = build_glpack(self.game_name, self.engine,
+                                    self.strings, results)
+            final    = (merge_glpacks(self.existing_pack, new_pack)
+                        if self.existing_pack else new_pack)
+
+            save_path = final.pack_path()
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            GLPackWriter.save(save_path, pack)
-            self.tick.emit(total, total,
-                           f"✓ บันทึก .glpack — {total:,} strings")
+            GLPackWriter.save(save_path, final)
+            GLPackCheckpoint.clear(game_id)   # ลบ checkpoint เมื่อเสร็จ
+
+            n = len(final.strings)
+            self.tick.emit(n, n, f"✓ บันทึก .glpack — {n:,} strings")
             self.finished.emit(save_path)
         except Exception as e:
-            self.tick.emit(total, total, f"⚠ บันทึก .glpack ล้มเหลว: {e}")
+            t = self.start_offset + total
+            self.tick.emit(t, t, f"⚠ บันทึก .glpack ล้มเหลว: {e}")
             self.finished.emit("")
 
 
@@ -658,6 +725,36 @@ class PostPatchDialog(QDialog):
             subprocess.Popen(["xdg-open", self.game_dir])
 
 
+class DraggableBar(QWidget):
+    """Navbar ที่ drag เพื่อย้ายหน้าต่าง + double-click เพื่อ maximize"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._drag_pos = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = (event.globalPosition().toPoint()
+                              - self.window().frameGeometry().topLeft())
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (event.buttons() == Qt.MouseButton.LeftButton
+                and self._drag_pos is not None):
+            self.window().move(
+                event.globalPosition().toPoint() - self._drag_pos)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            w = self.window()
+            w.showNormal() if w.isMaximized() else w.showMaximized()
+        super().mouseDoubleClickEvent(event)
+
+
 def _md_to_simple(text: str) -> str:
     """แปลง Markdown อย่างง่ายเป็น plain text สำหรับ QLabel"""
     import re
@@ -675,6 +772,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("GameLang Translator v2")
         self.setMinimumSize(960, 680)
+        # Frameless — custom title bar
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint
+                            | Qt.WindowType.Window)
         self.setStyleSheet(STYLESHEET)
 
         # State
@@ -685,14 +785,19 @@ class MainWindow(QMainWindow):
         self._extracted:    list[GameString] = []
         self._glpack_path:  str = ""
         self._update_info:  UpdateInfo | None = None
+        self._manifest:     list = []        # community pack manifest
+        self._current_pack: PackInfo | None = None
+        self._library:      list[dict] = load_library()   # persistent game library
 
         self._build_ui()
         self._check_update_async()
+        self._fetch_pack_manifest()
 
     # ── Build UI ──────────────────────────────────────────────────────────────
     def _build_ui(self):
-        root = QWidget(); self.setCentralWidget(root)
-        rl   = QVBoxLayout(root); rl.setContentsMargins(0,0,0,0); rl.setSpacing(0)
+        root = QWidget(); root.setObjectName("mainRoot")
+        self.setCentralWidget(root)
+        rl = QVBoxLayout(root); rl.setContentsMargins(1,1,1,1); rl.setSpacing(0)
         rl.addWidget(self._navbar())
         body = QWidget(); bl = QHBoxLayout(body)
         bl.setContentsMargins(0,0,0,0); bl.setSpacing(0)
@@ -700,55 +805,112 @@ class MainWindow(QMainWindow):
         bl.addWidget(self._main_area(), 1)
         rl.addWidget(body, 1)
 
-    def _navbar(self):
-        bar = QWidget(); bar.setFixedHeight(48)
-        bar.setStyleSheet(f"background:#0f0f1e;border-bottom:1px solid {NV_BORDER};")
-        lay = QHBoxLayout(bar); lay.setContentsMargins(20,0,20,0); lay.setSpacing(10)
+        # Size grip — bottom-right drag-to-resize handle
+        grip = QSizeGrip(self)
+        grip.setFixedSize(16, 16)
+        grip.setStyleSheet("QSizeGrip{background:transparent;}")
 
-        logo = QLabel("G"); logo.setFixedSize(22,22); logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    def _navbar(self):
+        bar = DraggableBar()
+        bar.setFixedHeight(46)
+        bar.setStyleSheet(f"background:#0a0a18;border-bottom:1px solid {NV_BORDER};")
+        lay = QHBoxLayout(bar); lay.setContentsMargins(16,0,4,0); lay.setSpacing(8)
+
+        # Logo + name
+        logo = QLabel("G"); logo.setFixedSize(20,20)
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
         logo.setStyleSheet(
             f"background:qlineargradient(x1:0,y1:0,x2:1,y2:1,"
             f"stop:0 {NV_GREEN},stop:1 #3050b0);color:#000;"
-            f"font-weight:900;font-size:12px;border-radius:2px;"
+            f"font-weight:900;font-size:11px;border-radius:3px;"
         )
-        nm  = QLabel("GameLang"); nm.setStyleSheet("color:#e0e8d8;font-size:13px;font-weight:800;")
-        sub = QLabel("TRANSLATOR"); sub.setStyleSheet(f"color:{NV_LABEL};font-size:9px;letter-spacing:2px;")
-        lay.addWidget(logo); lay.addWidget(nm); lay.addWidget(sub); lay.addStretch()
+        nm  = QLabel("GameLang")
+        nm.setStyleSheet("color:#e0e8d8;font-size:13px;font-weight:800;")
+        sub = QLabel("TRANSLATOR")
+        sub.setStyleSheet(f"color:{NV_LABEL};font-size:8px;letter-spacing:2px;")
+        lay.addWidget(logo); lay.addWidget(nm); lay.addWidget(sub)
+        lay.addStretch()
 
-        # Version label
+        # Version
         ver_lbl = QLabel(f"v{APP_VERSION}")
         ver_lbl.setStyleSheet(f"color:{NV_LABEL};font-size:9px;letter-spacing:1px;")
         lay.addWidget(ver_lbl)
 
-        # Update button — always visible, state changes based on check result
+        # Update button
         self._update_btn = QPushButton("⟳  ตรวจสอบ...")
-        self._update_btn.setFixedHeight(28)
-        self._update_btn.setEnabled(False)   # disabled while checking
+        self._update_btn.setFixedHeight(26)
+        self._update_btn.setEnabled(False)
         self._update_btn_style_checking = (
             f"QPushButton{{background:transparent;border:1px solid #1e2456;"
             f"color:{NV_MUTED};border-radius:2px;font-size:9px;letter-spacing:1px;"
-            f"font-weight:bold;padding:4px 12px;}}"
+            f"font-weight:bold;padding:3px 10px;}}"
         )
         self._update_btn_style_ok = (
             f"QPushButton{{background:transparent;border:1px solid #1e2456;"
             f"color:{NV_LABEL};border-radius:2px;font-size:9px;letter-spacing:1px;"
-            f"font-weight:bold;padding:4px 12px;}}"
+            f"font-weight:bold;padding:3px 10px;}}"
             f"QPushButton:enabled:hover{{border-color:{NV_MUTED};color:{NV_MUTED};}}"
         )
         self._update_btn_style_new = (
             f"QPushButton{{background:rgba(56,189,248,0.1);border:1px solid {NV_CYAN};"
             f"color:{NV_CYAN};border-radius:2px;font-size:9px;letter-spacing:2px;"
-            f"font-weight:bold;padding:4px 12px;}}"
+            f"font-weight:bold;padding:3px 10px;}}"
             f"QPushButton:enabled:hover{{background:rgba(56,189,248,0.25);}}"
         )
         self._update_btn.setStyleSheet(self._update_btn_style_checking)
-        self._update_btn.setVisible(True)
         self._update_btn.clicked.connect(self._on_update_click)
         lay.addWidget(self._update_btn)
 
-        set_btn = QPushButton("⚙"); set_btn.setFixedSize(34,34)
-        set_btn.clicked.connect(self._open_settings); lay.addWidget(set_btn)
+        # Settings — circular gear button
+        set_btn = QPushButton("⚙")
+        set_btn.setFixedSize(32, 32)
+        set_btn.setToolTip("Settings")
+        set_btn.setStyleSheet(
+            f"QPushButton{{background:rgba(18,18,36,0.9);"
+            f"border:1px solid #1e2456;color:{NV_MUTED};"
+            f"border-radius:16px;font-size:15px;padding:0;}}"
+            f"QPushButton:hover{{border-color:{NV_GREEN};color:{NV_GREEN};"
+            f"background:rgba(91,141,238,0.12);}}"
+        )
+        set_btn.clicked.connect(self._open_settings)
+        lay.addWidget(set_btn)
+
+        # ── Window controls ────────────────────────────────────────────────
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setFixedSize(1, 18)
+        sep.setStyleSheet("color:#1e1e38;"); lay.addWidget(sep)
+
+        for sym, slot, hover_c in [
+            ("−", self.showMinimized,    NV_MUTED),
+            ("□", self._toggle_maximize, NV_MUTED),
+            ("✕", self.close,            NV_RED),
+        ]:
+            b = QPushButton(sym); b.setFixedSize(36, 46)
+            b.setStyleSheet(
+                f"QPushButton{{background:transparent;border:none;"
+                f"color:#252545;font-size:13px;font-weight:300;"
+                f"border-radius:0;}}"
+                f"QPushButton:hover{{background:rgba(255,255,255,0.05);"
+                f"color:{hover_c};}}"
+            )
+            if sym == "✕":
+                b.setStyleSheet(
+                    f"QPushButton{{background:transparent;border:none;"
+                    f"color:#252545;font-size:12px;font-weight:300;"
+                    f"border-radius:0;}}"
+                    f"QPushButton:hover{{background:rgba(240,98,146,0.18);"
+                    f"color:{NV_RED};}}"
+                )
+            b.clicked.connect(slot)
+            lay.addWidget(b)
+
         return bar
+
+    def _toggle_maximize(self):
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
 
     def _sidebar(self):
         side = QWidget(); side.setFixedWidth(210)
@@ -764,21 +926,106 @@ class MainWindow(QMainWindow):
         self._hline(lay)
 
         self.game_list = QListWidget(); self.game_list.setIconSize(QSize(28,28))
-        for g in MOCK_GAMES:
-            item = QListWidgetItem(g["name"])
-            item.setData(Qt.ItemDataRole.UserRole, g)
-            if HAS_REQUESTS:
-                threading.Thread(target=self._load_icon,
-                                 args=(item, g["appid"]), daemon=True).start()
-            self.game_list.addItem(item)
+        # โหลดจาก library (ไม่มีรายการจนกว่าจะแสกนเจอ)
+        for entry in self._library:
+            self._add_item_to_list(entry)
         self.game_list.currentItemChanged.connect(self._on_game_selected)
         lay.addWidget(self.game_list, 1)
 
         self._hline(lay)
-        ft = QLabel(f"  {len(MOCK_GAMES)} GAMES"); ft.setFixedHeight(28)
-        ft.setStyleSheet("color:#2a3a2a;font-size:9px;letter-spacing:2px;padding-left:14px;")
-        lay.addWidget(ft)
+
+        # Footer: count + ADD GAME button
+        footer = QWidget(); footer.setFixedHeight(42)
+        footer.setStyleSheet(f"background:#0c0c1a;border-top:1px solid {NV_BORDER};")
+        fl = QHBoxLayout(footer); fl.setContentsMargins(10,0,8,0); fl.setSpacing(6)
+
+        self._lib_count_lbl = QLabel(f"  {len(self._library)} GAMES")
+        self._lib_count_lbl.setStyleSheet(
+            "color:#2a3a2a;font-size:9px;letter-spacing:2px;"
+        )
+        fl.addWidget(self._lib_count_lbl, 1)
+
+        add_btn = QPushButton("＋")
+        add_btn.setFixedSize(28, 28)
+        add_btn.setToolTip("เพิ่มเกมจากโฟลเดอร์")
+        add_btn.setStyleSheet(
+            f"QPushButton{{background:transparent;border:1px solid #1e2456;"
+            f"color:{NV_MUTED};border-radius:2px;font-size:13px;font-weight:bold;}}"
+            f"QPushButton:hover{{border-color:{NV_GREEN};color:{NV_GREEN};"
+            f"background:rgba(91,141,238,0.1);}}"
+        )
+        add_btn.clicked.connect(self._on_add_game)
+        fl.addWidget(add_btn)
+
+        lay.addWidget(footer)
         return side
+
+    def _add_item_to_list(self, entry: dict):
+        """เพิ่ม QListWidgetItem สำหรับ library entry"""
+        item = QListWidgetItem(entry["name"])
+        item.setData(Qt.ItemDataRole.UserRole, entry)
+        appid = entry.get("appid", 0)
+        if HAS_REQUESTS and appid:
+            threading.Thread(target=self._load_icon,
+                             args=(item, appid), daemon=True).start()
+        self.game_list.addItem(item)
+
+    def _update_library_count(self):
+        self._lib_count_lbl.setText(f"  {self.game_list.count()} GAMES")
+
+    def _on_add_game(self):
+        """ผู้ใช้กด ＋ → เลือกโฟลเดอร์ → detect engine → เพิ่มใน library ถ้าเจอ"""
+        from PyQt6.QtWidgets import QMessageBox
+        d = QFileDialog.getExistingDirectory(self, "เลือกโฟลเดอร์หลักของเกม")
+        if not d:
+            return
+
+        # Detect engine
+        result = detect(d)
+
+        if result.engine == Engine.UNKNOWN:
+            QMessageBox.warning(
+                self, "ไม่พบเกม",
+                f"ไม่พบ engine ที่รองรับในโฟลเดอร์:\n{d}\n\n"
+                "ลองเลือกโฟลเดอร์หลักของเกมโดยตรง\n"
+                "(เช่น .../Wandering Sword/ ไม่ใช่ .../steamapps/)"
+            )
+            return
+
+        # ชื่อเกม = ชื่อโฟลเดอร์สุดท้าย
+        name  = os.path.basename(d.rstrip("/\\")) or d
+        appid = KNOWN_APPIDS.get(name, 0)
+
+        # เช็คว่ามีอยู่แล้วหรือยัง (ซ้ำ game_dir)
+        from core.library import _normalize_dir
+        existing_dirs = {_normalize_dir(g.get("game_dir",""))
+                         for g in self._library}
+        if _normalize_dir(d) in existing_dirs:
+            # เลือก item นั้นในรายการ
+            for i in range(self.game_list.count()):
+                it = self.game_list.item(i)
+                g  = it.data(Qt.ItemDataRole.UserRole)
+                if _normalize_dir(g.get("game_dir","")) == _normalize_dir(d):
+                    self.game_list.setCurrentItem(it)
+                    break
+            return
+
+        # เพิ่มใน library
+        entry = make_entry(
+            name     = name,
+            game_dir = d,
+            engine   = result.engine.value,
+            method   = result.method.value,
+            appid    = appid,
+        )
+        self._library = add_game(self._library, entry)
+        save_library(self._library)
+
+        # เพิ่มใน sidebar + เลือก
+        self._add_item_to_list(entry)
+        self._update_library_count()
+        last_item = self.game_list.item(self.game_list.count() - 1)
+        self.game_list.setCurrentItem(last_item)
 
     def _main_area(self):
         self.stack = QStackedWidget()
@@ -799,10 +1046,11 @@ class MainWindow(QMainWindow):
     def _detail_page(self):
         w   = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0,0,0,0); lay.setSpacing(0)
 
-        # Hero image
-        self.hero = QLabel(); self.hero.setFixedHeight(190)
+        # Hero image — Steam artwork + gradient overlay + game name
+        self.hero = QLabel(); self.hero.setFixedHeight(220)
         self.hero.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.hero.setStyleSheet(f"background:#0f0f1e;color:{NV_MUTED};")
+        self.hero.setScaledContents(False)
+        self.hero.setStyleSheet("background:#09090e;")
         lay.addWidget(self.hero)
 
         # Scroll area
@@ -811,13 +1059,7 @@ class MainWindow(QMainWindow):
         content = QWidget(); self.cl = QVBoxLayout(content)
         self.cl.setContentsMargins(24,20,24,24); self.cl.setSpacing(12)
 
-        # ── Engine detect row ──────────────────────────────────────────────
-        self.engine_row = QHBoxLayout(); self.engine_row.setSpacing(8)
-        self.cl.addLayout(self.engine_row)
-
-        # ── Context cards row ──────────────────────────────────────────────
-        self.ctx_row = QHBoxLayout(); self.ctx_row.setSpacing(10)
-        self.cl.addLayout(self.ctx_row)
+        # engine_row / ctx_row ถูกลบออก — ข้อมูลใช้ internally ไม่แสดงใน UI
 
         # ── Game dir row ───────────────────────────────────────────────────
         dir_row = QHBoxLayout(); dir_row.setSpacing(8)
@@ -836,14 +1078,42 @@ class MainWindow(QMainWindow):
         self.extract_btn = QPushButton("◈  SCAN & EXTRACT ALL STRINGS")
         self.extract_btn.setEnabled(False); self.extract_btn.setFixedHeight(38)
         self.extract_btn.clicked.connect(self._on_extract)
-        stage_row.addWidget(self.extract_btn, 2)
-
-        self.scan_ctx_btn = QPushButton("⚙  SCAN CONTEXT")
-        self.scan_ctx_btn.setEnabled(False); self.scan_ctx_btn.setFixedHeight(38)
-        self.scan_ctx_btn.clicked.connect(self._on_scan_context)
-        stage_row.addWidget(self.scan_ctx_btn, 1)
+        stage_row.addWidget(self.extract_btn)
 
         self.cl.addLayout(stage_row)
+
+        # ── Community Pack Banner (hidden by default) ──────────────────────
+        self.pack_frame = QFrame()
+        self.pack_frame.setStyleSheet(
+            f"QFrame{{background:rgba(56,189,248,0.06);"
+            f"border:1px solid rgba(56,189,248,0.25);"
+            f"border-left:3px solid {NV_CYAN};border-radius:2px;}}"
+        )
+        pack_lay = QHBoxLayout(self.pack_frame)
+        pack_lay.setContentsMargins(14,8,10,8); pack_lay.setSpacing(10)
+
+        self.pack_info_lbl = QLabel("")
+        self.pack_info_lbl.setStyleSheet(
+            f"color:{NV_CYAN};font-size:11px;background:transparent;border:none;"
+        )
+        pack_lay.addWidget(self.pack_info_lbl, 1)
+
+        self.pack_dl_btn = QPushButton("⬇  DOWNLOAD THAI PACK")
+        self.pack_dl_btn.setFixedHeight(30)
+        self.pack_dl_btn.setStyleSheet(
+            f"QPushButton{{background:rgba(56,189,248,0.12);"
+            f"border:1px solid {NV_CYAN};color:{NV_CYAN};"
+            f"border-radius:2px;font-size:9px;letter-spacing:2px;"
+            f"font-weight:bold;padding:4px 14px;}}"
+            f"QPushButton:hover{{background:rgba(56,189,248,0.3);}}"
+            f"QPushButton:disabled{{border-color:#1e2456;color:#2a3a58;"
+            f"background:transparent;}}"
+        )
+        self.pack_dl_btn.clicked.connect(self._on_download_pack)
+        pack_lay.addWidget(self.pack_dl_btn)
+
+        self.pack_frame.setVisible(False)
+        self.cl.addWidget(self.pack_frame)
 
         # ── Progress bar ───────────────────────────────────────────────────
         self.prog_bar = QProgressBar()
@@ -886,6 +1156,21 @@ class MainWindow(QMainWindow):
         )
         self.rollback_btn.clicked.connect(self._on_rollback)
         action_row.addWidget(self.rollback_btn)
+
+        self.delete_pack_btn = QPushButton("🗑")
+        self.delete_pack_btn.setEnabled(False)
+        self.delete_pack_btn.setFixedSize(40, 40)
+        self.delete_pack_btn.setToolTip("ลบไฟล์แปล (.glpack)")
+        self.delete_pack_btn.setStyleSheet(
+            "QPushButton{background:transparent;border:1px solid #1a1020;"
+            "color:#3a2030;border-radius:2px;font-size:14px;}"
+            "QPushButton:enabled{border-color:#3a1a2a;color:#7a3040;}"
+            "QPushButton:enabled:hover{background:rgba(240,98,146,0.12);"
+            "border-color:#f06292;color:#f06292;}"
+            "QPushButton:disabled{border-color:#1a1020;color:#2a1020;}"
+        )
+        self.delete_pack_btn.clicked.connect(self._on_delete_pack)
+        action_row.addWidget(self.delete_pack_btn)
 
         self.cl.addLayout(action_row)
         self.cl.addStretch()
@@ -941,26 +1226,49 @@ class MainWindow(QMainWindow):
     def _set_busy(self, busy: bool):
         """Disable/enable interactive buttons during background work"""
         self.extract_btn.setEnabled(not busy)
-        self.scan_ctx_btn.setEnabled(not busy)
+        pass  # scan_ctx_btn removed
         self.translate_btn.setEnabled(not busy)
         self.patch_btn.setEnabled(not busy)
         self.rollback_btn.setEnabled(not busy)
+        self.delete_pack_btn.setEnabled(not busy)
+        # pack_dl_btn is managed separately (already disabled when downloading)
 
     def _update_stats(self):
         self._clear_layout(self.stats_row)
+        # enable delete ถ้ามีไฟล์ .glpack
+        has_pack = bool(self._glpack_path and os.path.exists(self._glpack_path))
+        self.delete_pack_btn.setEnabled(has_pack)
         count = len(self._extracted)
         if count:
             self.stats_row.addWidget(
                 self._card("STRINGS", f"{count:,} strings", NV_GREEN)
             )
         if self._glpack_path and os.path.exists(self._glpack_path):
-            size_mb = GLPackReader.file_size_mb(self._glpack_path)
-            pack = GLPackReader.load(self._glpack_path)
+            # Determine if this is a community pack or user-translated pack
+            from core.glpack import GLPACK_DIR
+            is_community = (self._current_pack is not None and
+                            self._glpack_path == os.path.join(
+                                GLPACK_DIR, f"{self._current_pack.game_id}.glpack"))
+            try:
+                size_mb = GLPackReader.file_size_mb(self._glpack_path)
+                pack    = GLPackReader.load(self._glpack_path)
+                pack_sc = pack.string_count
+            except Exception:
+                size_mb = os.path.getsize(self._glpack_path) / 1_048_576
+                pack_sc = (self._current_pack.string_count
+                           if self._current_pack else 0)
+
+            label = "COMMUNITY PACK" if is_community else ".glpack"
+            color = NV_CYAN
             self.stats_row.addWidget(
-                self._card(".glpack", f"{size_mb:.2f} MB · {pack.string_count:,} strings", NV_CYAN)
+                self._card(label,
+                           f"{size_mb:.2f} MB · {pack_sc:,} strings",
+                           color)
             )
+            source = ("สาธารณะ — ไม่ต้องใช้ API"
+                      if is_community else "✓ พร้อม patch เกม")
             self.stats_row.addWidget(
-                self._card("STATUS", "✓ พร้อม patch เกม", NV_PURPLE)
+                self._card("STATUS", source, NV_PURPLE)
             )
         elif count:
             self.stats_row.addWidget(
@@ -989,25 +1297,32 @@ class MainWindow(QMainWindow):
         self.detect_result = None
         self._extracted    = []
         self._glpack_path  = ""
-        self.game_dir      = self._find_steam_dir(self.selected_game["name"])
+        # game_dir มาจาก library entry (เพิ่มตอน scan แล้ว)
+        stored_dir = self.selected_game.get("game_dir", "")
+        if stored_dir and os.path.isdir(stored_dir):
+            self.game_dir = stored_dir
+        else:
+            # fallback: ลองหาใน Steam (กรณี library เก่า/ย้ายไฟล์)
+            self.game_dir = self._find_steam_dir(self.selected_game["name"]) or ""
 
         self.stack.setCurrentIndex(1)
         self.extract_btn.setEnabled(bool(self.game_dir))
-        self.scan_ctx_btn.setEnabled(True)
+        pass  # scan context runs automatically
         self.translate_btn.setEnabled(False)
         self.patch_btn.setEnabled(False)
         self.prog_log.setText("")
         self.prog_bar.setVisible(False)
+        self.pack_frame.setVisible(False)
+        self._current_pack = None
 
-        self.hero.setText(f"  {self.selected_game['name']}")
-        self.hero.setStyleSheet(
-            f"background:#0f0f1e;color:#e0e8d8;font-size:22px;font-weight:bold;"
-        )
+        # Reset hero — placeholder แสดงทันที, Steam art โหลดใน background
+        self.hero.clear()
+        self.hero.setStyleSheet("background:#09090e;")
+        self._render_hero_placeholder(self.selected_game["name"])
         self.dir_label.setText(
             f"โฟลเดอร์เกม: {self.game_dir or '— (ไม่พบ กรุณาเลือกเอง)'}"
         )
-        self._clear_layout(self.ctx_row)
-        self._clear_layout(self.engine_row)
+        pass  # engine_row / ctx_row removed
         self._clear_layout(self.stats_row)
         self._update_rollback_btn()
 
@@ -1018,21 +1333,115 @@ class MainWindow(QMainWindow):
         if self.game_dir:
             self._run_engine_detect()
 
+        # Show community pack banner if available
+        self._check_community_pack()
+
+        # Auto-scan game context (non-blocking background)
+        QTimer.singleShot(200, self._on_scan_context)
+
     def _load_hero(self):
+        """โหลด Steam artwork ใน background thread"""
+        game  = self.selected_game
+        if not game:
+            return
+        appid = game.get("appid", 0)
+        if not appid:
+            return   # placeholder แสดงแล้วตอน _on_game_selected
         try:
-            url = (f"https://cdn.akamai.steamstatic.com/steam/apps/"
-                   f"{self.selected_game['appid']}/header.jpg")
-            r   = requests.get(url, timeout=4)
-            pix = QPixmap(); pix.loadFromData(r.content)
-            QTimer.singleShot(0, lambda: self.hero.setPixmap(
-                pix.scaled(
-                    self.hero.width(), self.hero.height(),
-                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-            ))
+            # ลอง URL จากใหญ่ไปเล็ก
+            for suffix in ["library_hero.jpg",
+                           "capsule_616x353.jpg",
+                           "header.jpg"]:
+                url = (f"https://cdn.akamai.steamstatic.com/"
+                       f"steam/apps/{appid}/{suffix}")
+                r   = requests.get(url, timeout=5)
+                if r.status_code == 200:
+                    raw  = r.content
+                    name = game["name"]
+                    QTimer.singleShot(
+                        0, lambda b=raw, n=name: self._render_hero(b, n))
+                    return
         except Exception:
             pass
+
+    def _render_hero(self, raw_bytes: bytes, name: str):
+        """วาด hero image พร้อม gradient overlay และชื่อเกม (main thread)"""
+        pix = QPixmap()
+        if not pix.loadFromData(raw_bytes):
+            return
+
+        w = max(self.hero.width(), 800)
+        h = self.hero.height()
+
+        # Scale-to-fill + center-crop
+        scaled = pix.scaled(w, h,
+                             Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                             Qt.TransformationMode.SmoothTransformation)
+        cx = (scaled.width()  - w) // 2
+        cy = (scaled.height() - h) // 2
+        cropped = scaled.copy(cx, cy, w, h)
+
+        # Composite: image + gradient overlay + game name
+        result  = QPixmap(cropped.size())
+        painter = QPainter(result)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.drawPixmap(0, 0, cropped)
+
+        # Dark gradient from bottom
+        grad = QLinearGradient(0, 0, 0, h)
+        grad.setColorAt(0.00, QColor(9, 9, 18,   0))
+        grad.setColorAt(0.35, QColor(9, 9, 18,  30))
+        grad.setColorAt(0.68, QColor(9, 9, 18, 185))
+        grad.setColorAt(1.00, QColor(9, 9, 18, 255))
+        painter.fillRect(0, 0, w, h, grad)
+
+        # Game name text
+        font = QFont("Segoe UI", 20, QFont.Weight.Bold)
+        painter.setFont(font)
+        painter.setPen(QColor(215, 228, 255, 230))
+        painter.drawText(QRectF(20, 0, w - 30, h - 14),
+                         Qt.AlignmentFlag.AlignLeft
+                         | Qt.AlignmentFlag.AlignBottom,
+                         name)
+        painter.end()
+        self.hero.setPixmap(result)
+
+    def _render_hero_placeholder(self, name: str):
+        """แสดง placeholder แบบ gradient เมื่อไม่มี Steam artwork"""
+        w = max(self.hero.width(), 800)
+        h = self.hero.height()
+        result  = QPixmap(w, h)
+        painter = QPainter(result)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Background gradient
+        bg = QLinearGradient(0, 0, w, h)
+        bg.setColorAt(0, QColor(18, 18, 48))
+        bg.setColorAt(1, QColor(9,  9,  18))
+        painter.fillRect(0, 0, w, h, bg)
+
+        # Subtle dot grid
+        painter.setPen(QPen(QColor(30, 38, 80, 70), 1))
+        for gx in range(0, w, 36):
+            for gy in range(0, h, 36):
+                painter.drawPoint(gx, gy)
+
+        # Bottom fade
+        fade = QLinearGradient(0, h // 2, 0, h)
+        fade.setColorAt(0, QColor(9, 9, 18,   0))
+        fade.setColorAt(1, QColor(9, 9, 18, 220))
+        painter.fillRect(0, 0, w, h, fade)
+
+        # Game name
+        font = QFont("Segoe UI", 20, QFont.Weight.Bold)
+        painter.setFont(font)
+        painter.setPen(QColor(180, 200, 255, 200))
+        painter.drawText(QRectF(20, 0, w - 30, h - 14),
+                         Qt.AlignmentFlag.AlignLeft
+                         | Qt.AlignmentFlag.AlignBottom,
+                         name)
+        painter.end()
+        self.hero.setPixmap(result)
 
     def _pick_game_dir(self):
         d = QFileDialog.getExistingDirectory(self, "เลือกโฟลเดอร์เกม")
@@ -1041,38 +1450,148 @@ class MainWindow(QMainWindow):
             self.dir_label.setText(f"โฟลเดอร์เกม: {d}")
             self.extract_btn.setEnabled(True)
             self._run_engine_detect()
+            QTimer.singleShot(100, self._on_scan_context)
 
     def _run_engine_detect(self):
-        self._clear_layout(self.engine_row)
         if not self.game_dir:
             return
         result = detect(self.game_dir)
-        self.detect_result = result
-        icon, label, color = METHOD_LABELS.get(result.method, ("?","Unknown","#aaa"))
-        for c in [
-            self._card("ENGINE DETECTED",
-                       f"{result.engine.value.upper()} ({result.confidence*100:.0f}%)", color),
-            self._card("PATCH METHOD", f"{icon} {label}", color),
-            self._card("เหตุผล", result.reason, "#666"),
-        ]:
-            self.engine_row.addWidget(c)
+        self.detect_result = result   # เก็บไว้ใช้ตอน patch — ไม่แสดงใน UI
 
-    # ── Stage 1: Scan context (optional) ─────────────────────────────────────
+    # ── Community Pack ────────────────────────────────────────────────────────
+    def _fetch_pack_manifest(self):
+        """Fetch packs.json manifest from GitHub in background"""
+        w = PackFetchWorker()
+        w.finished.connect(self._on_manifest_fetched)
+        w.start()
+        self._manifest_worker = w
+
+    def _on_manifest_fetched(self, manifest: list):
+        self._manifest = manifest
+        # Refresh banner if a game is already selected
+        if self.selected_game:
+            self._check_community_pack()
+
+    def _check_community_pack(self):
+        """Show/hide community pack banner for current game"""
+        if not self.selected_game:
+            self.pack_frame.setVisible(False)
+            return
+
+        pack = find_pack(self._manifest, self.selected_game["name"])
+        if not pack:
+            self.pack_frame.setVisible(False)
+            self._current_pack = None
+            return
+
+        self._current_pack = pack
+
+        # Check if already downloaded locally
+        from core.glpack import GLPACK_DIR
+        local_path = os.path.join(GLPACK_DIR, f"{pack.game_id}.glpack")
+        if os.path.exists(local_path):
+            sz = os.path.getsize(local_path)
+            self.pack_info_lbl.setText(
+                f"✓  Thai Pack v{pack.pack_version}  ·  {pack.string_count:,} strings"
+                f"  ·  {size_str(sz)}  (downloaded)"
+            )
+            self.pack_dl_btn.setText("✓  DOWNLOADED")
+            self.pack_dl_btn.setEnabled(False)
+            # Enable PATCH button directly — no API key needed
+            self._glpack_path = local_path
+            self.patch_btn.setEnabled(bool(self.game_dir))
+            self._update_stats()
+        else:
+            sz_str = size_str(pack.size_bytes) if pack.size_bytes else ""
+            self.pack_info_lbl.setText(
+                f"⬇  Thai Pack v{pack.pack_version}  ·  {pack.string_count:,} strings"
+                + (f"  ·  {sz_str}" if sz_str else "")
+                + "  — แปลสำเร็จแล้ว ไม่ต้องใช้ API key"
+            )
+            self.pack_dl_btn.setText("⬇  DOWNLOAD THAI PACK")
+            self.pack_dl_btn.setEnabled(True)
+
+        self.pack_frame.setVisible(True)
+
+    def _on_download_pack(self):
+        """Start downloading community pack"""
+        if not self._current_pack:
+            return
+        if not self.game_dir:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "ข้อผิดพลาด",
+                                "กรุณาเลือกโฟลเดอร์เกมก่อน")
+            return
+
+        self.pack_dl_btn.setText("⟳  DOWNLOADING...")
+        self.pack_dl_btn.setEnabled(False)
+        self.prog_bar.setRange(0, 100)
+        self.prog_bar.setValue(0)
+        self.prog_bar.setVisible(True)
+        self.prog_log.setText(f"กำลังดาวน์โหลด Thai Pack v{self._current_pack.pack_version}...")
+        self._set_busy(True)
+
+        w = PackDownloadWorker(self._current_pack)
+        w.progress.connect(self._on_pack_dl_progress)
+        w.finished.connect(self._on_pack_dl_done)
+        w.error.connect(lambda msg: self.prog_log.setText(f"⚠ Download ล้มเหลว: {msg}"))
+        w.start()
+        self._pack_dl_worker = w
+
+    def _on_pack_dl_progress(self, downloaded: int, total: int):
+        if total > 0:
+            pct = int(downloaded / total * 100)
+            self.prog_bar.setValue(pct)
+            self.prog_log.setText(
+                f"กำลังดาวน์โหลด {size_str(downloaded)} / {size_str(total)} ({pct}%)"
+            )
+        else:
+            self.prog_log.setText(f"กำลังดาวน์โหลด {size_str(downloaded)}...")
+
+    def _on_pack_dl_done(self, local_path: str):
+        self.prog_bar.setRange(0, 100)
+        self.prog_bar.setValue(100)
+        QTimer.singleShot(600, lambda: self.prog_bar.setVisible(False))
+
+        self.extract_btn.setEnabled(bool(self.game_dir))
+        pass  # scan context runs automatically
+        self.translate_btn.setEnabled(bool(self._extracted))
+        self.rollback_btn.setEnabled(False)
+
+        if local_path and os.path.exists(local_path):
+            self._glpack_path = local_path
+            self.patch_btn.setEnabled(bool(self.game_dir))
+            self.prog_log.setText(
+                f"✓ Thai Pack พร้อมแล้ว — กด ⚡ PATCH GAME ได้เลย"
+            )
+            # Update banner
+            if self._current_pack:
+                sz = os.path.getsize(local_path)
+                self.pack_info_lbl.setText(
+                    f"✓  Thai Pack v{self._current_pack.pack_version}"
+                    f"  ·  {self._current_pack.string_count:,} strings"
+                    f"  ·  {size_str(sz)}"
+                )
+                self.pack_dl_btn.setText("✓  DOWNLOADED")
+                self.pack_dl_btn.setEnabled(False)
+            self._update_rollback_btn()
+            self._update_stats()
+        else:
+            self.patch_btn.setEnabled(False)
+            self.pack_dl_btn.setText("⬇  DOWNLOAD THAI PACK")
+            self.pack_dl_btn.setEnabled(True)
+
+    # ── Stage 1: Scan context (auto — ไม่มีปุ่ม) ────────────────────────────
     def _on_scan_context(self):
+        """เรียกอัตโนมัติตอนเลือกเกม / เลือกโฟลเดอร์"""
         if not self.selected_game: return
-        self.scan_ctx_btn.setEnabled(False); self.scan_ctx_btn.setText("⟳  SCANNING...")
-        self.prog_log.setText("กำลัง scan game context...")
         w = ScanWorker(self.selected_game)
-        w.finished.connect(self._on_scan_ctx_done); w.start()
+        w.finished.connect(self._on_scan_ctx_done)
+        w.start()
         self._scan_worker = w
 
     def _on_scan_ctx_done(self, ctx):
-        self.game_context = ctx
-        self.scan_ctx_btn.setEnabled(True); self.scan_ctx_btn.setText("⚙  SCAN CONTEXT")
-        self._clear_layout(self.ctx_row)
-        for label, key in [("WORLD","world"),("TONE","tone"),("REGISTER","register")]:
-            self.ctx_row.addWidget(self._card(label, ctx.get(key,"—")))
-        self.prog_log.setText("✓ Game context พร้อม — กด EXTRACT ได้เลย")
+        self.game_context = ctx   # เก็บไว้ใช้ตอนแปล — ไม่แสดงใน UI
 
     # ── Stage 2: Extract strings ──────────────────────────────────────────────
     def _on_extract(self):
@@ -1100,7 +1619,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(600, lambda: self.prog_bar.setVisible(False))
 
         self.extract_btn.setEnabled(True); self.extract_btn.setText("◈  EXTRACT AGAIN")
-        self.scan_ctx_btn.setEnabled(True)
+        pass  # scan context runs automatically
         self.translate_btn.setEnabled(len(strings) > 0)
         self.patch_btn.setEnabled(False)
         self._update_rollback_btn()
@@ -1129,18 +1648,41 @@ class MainWindow(QMainWindow):
             )
             return
 
+        game_id = self.selected_game["name"].lower().replace(" ", "_")
         engine  = (self.detect_result.engine.value if self.detect_result else "unknown")
         total   = len(self._extracted)
 
+        # ── ตรวจ checkpoint — auto resume ถ้ามี ─────────────────────────────
+        checkpoint    = GLPackCheckpoint.load(game_id)
+        existing_pack = None
+        to_translate  = self._extracted
+        start_offset  = 0
+
+        if checkpoint and checkpoint.string_count > 0:
+            already_ids  = set(checkpoint.strings.keys())
+            to_translate = [s for s in self._extracted
+                            if s.id not in already_ids]
+            existing_pack = checkpoint
+            start_offset  = checkpoint.string_count
+
+        # ── เริ่ม translation ────────────────────────────────────────────────
+        n_new     = len(to_translate)
+        bar_total = start_offset + n_new
+
         self._set_busy(True)
         self.translate_btn.setText("⟳  TRANSLATING...")
-        self.prog_bar.setRange(0, total); self.prog_bar.setValue(0)
+        self.prog_bar.setRange(0, bar_total)
+        self.prog_bar.setValue(start_offset)
         self.prog_bar.setVisible(True)
-        self.prog_log.setText(f"กำลังเตรียมแปล {total:,} strings...")
+        resume_note = f" (resume จาก {start_offset:,})" if start_offset else ""
+        self.prog_log.setText(
+            f"กำลังเตรียมแปล {n_new:,} strings{resume_note}...")
 
         w = TranslateAllWorker(
             self.selected_game["name"], engine,
-            self._extracted, self.game_context,
+            to_translate, self.game_context,
+            existing_pack=existing_pack,
+            start_offset=start_offset,
         )
         w.tick.connect(self._on_translate_tick)
         w.finished.connect(self._on_translated_all)
@@ -1158,7 +1700,7 @@ class MainWindow(QMainWindow):
         self.translate_btn.setEnabled(True)
         self.translate_btn.setText("▶  TRANSLATE ALL  →  .glpack")
         self.patch_btn.setEnabled(ok)
-        self.scan_ctx_btn.setEnabled(True)
+        pass  # scan context runs automatically
         self.extract_btn.setEnabled(True)
         self._update_rollback_btn()
 
@@ -1230,7 +1772,6 @@ class MainWindow(QMainWindow):
         self.patch_btn.setEnabled(True); self.patch_btn.setText("⚡  PATCH GAME")
         self.translate_btn.setEnabled(True)
         self.extract_btn.setEnabled(True)
-        self.scan_ctx_btn.setEnabled(True)
         self.prog_bar.setRange(0, 100); self.prog_bar.setValue(100)
         QTimer.singleShot(600, lambda: self.prog_bar.setVisible(False))
         self._update_rollback_btn()
@@ -1244,6 +1785,70 @@ class MainWindow(QMainWindow):
             self.game_dir, count, parent=self,
         )
         dlg.exec()
+
+        # Auto-upload .glpack ถ้ามี GitHub token
+        self._start_pack_upload()
+
+    def _start_pack_upload(self):
+        """อัปโหลด .glpack ขึ้น GitHub ถ้ามี token — เงียบๆ ใน background"""
+        token = _load_config().get("github_token", "").strip()
+        if not token or not self._glpack_path:
+            return
+        if not os.path.exists(self._glpack_path):
+            return
+
+        # นับ string count จาก pack
+        try:
+            pack   = GLPackReader.load(self._glpack_path)
+            n_str  = len(pack.strings)
+        except Exception:
+            n_str  = 0
+
+        self.prog_bar.setRange(0, 0); self.prog_bar.setVisible(True)
+        self.prog_log.setText("⬆ กำลังอัปโหลด Thai Pack ขึ้น GitHub...")
+
+        w = PackUploadWorker(
+            self._glpack_path,
+            self.selected_game["name"],
+            n_str, token,
+        )
+        w.progress.connect(lambda m: self.prog_log.setText(f"⬆ {m}"))
+        w.finished.connect(self._on_pack_uploaded)
+        w.start()
+        self._upload_worker = w
+
+    def _on_pack_uploaded(self, url: str):
+        self.prog_bar.setRange(0, 100); self.prog_bar.setValue(100)
+        QTimer.singleShot(800, lambda: self.prog_bar.setVisible(False))
+        # Refresh manifest so community pack banner updates
+        if url:
+            self._fetch_pack_manifest()
+
+    # ── Delete pack ───────────────────────────────────────────────────────────
+    def _on_delete_pack(self):
+        """ลบ .glpack และ checkpoint ของเกมนี้ → reset สถานะ"""
+        if not self._glpack_path:
+            return
+        game_id = self.selected_game["name"].lower().replace(" ", "_")
+
+        # ลบ .glpack
+        try:
+            if os.path.exists(self._glpack_path):
+                os.remove(self._glpack_path)
+        except Exception as e:
+            QMessageBox.warning(self, "ลบไม่ได้", f"ลบ .glpack ล้มเหลว:\n{e}")
+            return
+
+        # ลบ checkpoint ด้วย (ถ้ามี)
+        GLPackCheckpoint.clear(game_id)
+
+        # Reset UI state
+        self._glpack_path = ""
+        self.patch_btn.setEnabled(False)
+        self.translate_btn.setEnabled(bool(self._extracted))
+        self.delete_pack_btn.setEnabled(False)
+        self.prog_log.setText("🗑 ลบไฟล์แปลแล้ว — กด TRANSLATE ALL เพื่อแปลใหม่")
+        self._update_stats()
 
     # ── Rollback ──────────────────────────────────────────────────────────────
     def _on_rollback(self):
@@ -1276,7 +1881,7 @@ class MainWindow(QMainWindow):
         self.patch_btn.setEnabled(bool(self._glpack_path))
         self.extract_btn.setEnabled(True)
         self.translate_btn.setEnabled(bool(self._extracted))
-        self.scan_ctx_btn.setEnabled(True)
+        pass  # scan context runs automatically
 
         if errors:
             QMessageBox.warning(
@@ -1293,35 +1898,60 @@ class MainWindow(QMainWindow):
     # ── Settings ──────────────────────────────────────────────────────────────
     def _open_settings(self):
         from PyQt6.QtWidgets import QDialog, QRadioButton, QGroupBox
-        dlg = QDialog(self); dlg.setWindowTitle("Settings"); dlg.setFixedSize(340,280)
+        cfg = _load_config()
+
+        dlg = QDialog(self); dlg.setWindowTitle("Settings")
+        dlg.setFixedSize(400, 320)
         dlg.setStyleSheet(
             f"QDialog{{background:{NV_PANEL};border:1px solid {NV_BORDER};}}"
             f"QLabel{{color:{NV_TEXT};}}"
             f"QRadioButton{{color:#90b8f8;spacing:8px;}}"
+            f"QLineEdit{{background:#0a0a18;border:1px solid #1e2456;"
+            f"color:{NV_TEXT};padding:5px 8px;border-radius:2px;}}"
         )
         lay = QVBoxLayout(dlg); lay.setContentsMargins(22,20,22,20); lay.setSpacing(12)
+
         hdr = QLabel("⚙  SETTINGS")
         hdr.setStyleSheet(
             f"color:{NV_GREEN};font-size:10px;letter-spacing:4px;font-weight:bold;"
         )
         lay.addWidget(hdr)
-        line = QFrame(); line.setFrameShape(QFrame.Shape.HLine)
-        line.setStyleSheet(f"color:{NV_BORDER};"); lay.addWidget(line)
+        self._hline(lay)
+
+        # ── Target language ────────────────────────────────────────────────
         ll = QLabel("TARGET LANGUAGE")
-        ll.setStyleSheet(
-            f"color:{NV_LABEL};font-size:9px;letter-spacing:3px;font-weight:bold;"
-        )
+        ll.setStyleSheet(f"color:{NV_LABEL};font-size:9px;letter-spacing:3px;font-weight:bold;")
         lay.addWidget(ll)
         gb = QGroupBox(); gb.setStyleSheet(
-            "QGroupBox{border:1px solid #1e2456;border-radius:2px;padding:8px;}"
-        )
+            "QGroupBox{border:1px solid #1e2456;border-radius:2px;padding:8px;}")
         gl = QVBoxLayout(gb)
         rb_th = QRadioButton("ภาษาไทย  (default)"); rb_th.setChecked(True)
         more  = QLabel("   — เพิ่มภาษาเร็วๆ นี้")
         more.setStyleSheet("color:#2a3a2a;font-size:11px;")
         gl.addWidget(rb_th); gl.addWidget(more); lay.addWidget(gb)
-        ok = QPushButton("✓  บันทึก"); ok.clicked.connect(dlg.accept)
-        lay.addWidget(ok); dlg.exec()
+
+        # ── GitHub PAT (สำหรับ auto-upload pack) ──────────────────────────
+        gh_lbl = QLabel("GITHUB TOKEN  (สำหรับ auto-upload Thai Pack)")
+        gh_lbl.setStyleSheet(f"color:{NV_LABEL};font-size:9px;letter-spacing:2px;font-weight:bold;")
+        lay.addWidget(gh_lbl)
+
+        gh_edit = QLineEdit()
+        gh_edit.setPlaceholderText("ghp_xxxxxxxxxxxxxxxxxxxx")
+        gh_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        gh_edit.setText(cfg.get("github_token", ""))
+        gh_hint = QLabel("สร้างได้ที่ github.com/settings/tokens → repo scope")
+        gh_hint.setStyleSheet(f"color:#2a3a4a;font-size:10px;")
+        lay.addWidget(gh_edit); lay.addWidget(gh_hint)
+
+        # ── Save ───────────────────────────────────────────────────────────
+        def _save():
+            cfg["github_token"] = gh_edit.text().strip()
+            _save_config(cfg)
+            dlg.accept()
+
+        ok = QPushButton("✓  บันทึก"); ok.clicked.connect(_save)
+        lay.addWidget(ok)
+        dlg.exec()
 
     # ── Auto-update ───────────────────────────────────────────────────────────
     def _check_update_async(self):

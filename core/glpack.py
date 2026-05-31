@@ -12,8 +12,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
-GLPACK_VERSION = "1.0"
-GLPACK_DIR     = os.path.join(os.path.expanduser("~"), ".gamelang", "packs")
+GLPACK_VERSION    = "1.0"
+GLPACK_DIR        = os.path.join(os.path.expanduser("~"), ".gamelang", "packs")
+CHECKPOINT_SUFFIX = ".checkpoint"
+CHECKPOINT_EVERY  = 500   # save checkpoint ทุกกี่ strings
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -128,6 +130,61 @@ class GLPackReader:
             return os.path.getsize(path) / 1_048_576
         except Exception:
             return 0.0
+
+
+# ── Merge ─────────────────────────────────────────────────────────────────────
+def merge_glpacks(base: "GLPack", update: "GLPack") -> "GLPack":
+    """
+    รวม GLPack สองอัน — update override base (key = string ID)
+    ใช้สำหรับ: checkpoint + new translations → final pack
+    """
+    merged         = GLPack(game=base.game, game_id=base.game_id,
+                             engine=base.engine, version=base.version,
+                             created_at=base.created_at)
+    merged.strings = {**base.strings, **update.strings}
+    merged.string_count = len(merged.strings)
+    return merged
+
+
+# ── Checkpoint ────────────────────────────────────────────────────────────────
+class GLPackCheckpoint:
+    """บันทึก/โหลด progress ระหว่างการแปล — สำรองทุก CHECKPOINT_EVERY strings"""
+
+    @staticmethod
+    def path(game_id: str) -> str:
+        return os.path.join(GLPACK_DIR,
+                            f"{game_id}.glpack{CHECKPOINT_SUFFIX}")
+
+    @staticmethod
+    def exists(game_id: str) -> bool:
+        return os.path.exists(GLPackCheckpoint.path(game_id))
+
+    @staticmethod
+    def save(pack: "GLPack") -> None:
+        """บันทึก checkpoint (thread-safe — pure file I/O)"""
+        try:
+            GLPackWriter.save(GLPackCheckpoint.path(pack.game_id), pack)
+        except Exception:
+            pass   # อย่าให้ checkpoint fail ทำให้ translation พัง
+
+    @staticmethod
+    def load(game_id: str) -> "GLPack | None":
+        cp = GLPackCheckpoint.path(game_id)
+        if not os.path.exists(cp):
+            return None
+        try:
+            return GLPackReader.load(cp)
+        except Exception:
+            return None
+
+    @staticmethod
+    def clear(game_id: str) -> None:
+        cp = GLPackCheckpoint.path(game_id)
+        try:
+            if os.path.exists(cp):
+                os.remove(cp)
+        except Exception:
+            pass
 
 
 # ── Builder helper ────────────────────────────────────────────────────────────
