@@ -57,28 +57,30 @@ def _read_index(pak_path: str) -> tuple[str, list[_PakEntryMeta]]:
         for _ in range(file_count):
             fname = _read_fstring_fh(fh)
 
+            # UE4 pak v3 entry layout (verified empirically):
+            # offset(8) + size(8) + uncompressed(8) + comp_method(4) + sha1(20)
+            # + block_count(4) + blocks(n×16) + bEncrypted(1)
+            # + CompressionBlockSize(4)  ← only when comp_method != 0
             offset      = struct.unpack('<q', fh.read(8))[0]
             size        = struct.unpack('<q', fh.read(8))[0]
             size_decom  = struct.unpack('<q', fh.read(8))[0]
+            comp_method = struct.unpack('<I', fh.read(4))[0]   # BEFORE sha1
             sha1        = fh.read(20)
-            comp_method = struct.unpack('<I', fh.read(4))[0]
-            encrypted   = struct.unpack('B', fh.read(1))[0]
-            block_size  = struct.unpack('<I', fh.read(4))[0]
+            block_count = struct.unpack('<I', fh.read(4))[0]   # TArray count
 
             comp_blocks = []
-            if comp_method != 0:
-                block_count = struct.unpack('<I', fh.read(4))[0]
-                for _ in range(block_count):
-                    bs, be = struct.unpack('<qq', fh.read(16))
-                    comp_blocks.append((bs, be))
+            for _b in range(block_count):
+                bs, be = struct.unpack('<qq', fh.read(16))
+                comp_blocks.append((bs, be))
 
-            # Each file in pak has a per-file mini-header before data
-            # Size: offset(8)+size(8)+size_decom(8)+sha1(20)+comp(4)+enc(1)+blocksize(4) = 53
-            # + optional comp_blocks
-            per_file_header = 53 + len(comp_blocks) * 16
+            encrypted  = struct.unpack('B', fh.read(1))[0]
+            block_size = 0
             if comp_method != 0:
-                per_file_header += 4  # block_count field
+                block_size = struct.unpack('<I', fh.read(4))[0]  # only for compressed
 
+            # Per-file header size matches index entry layout (same fields):
+            # base 53 bytes (no compression) + n×16 (blocks) + 4 (block_size if compressed)
+            per_file_header = 53 + len(comp_blocks) * 16 + (4 if comp_method != 0 else 0)
             data_offset = offset + per_file_header
 
             entries.append(_PakEntryMeta(

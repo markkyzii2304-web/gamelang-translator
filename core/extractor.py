@@ -374,9 +374,11 @@ def _extract_ue4(game_dir: str, log) -> list[GameString]:
         log("ไม่พบ Content/Paks — ไม่ใช่ UE4 game")
         return results
 
-    # หา pak ต้นฉบับ (ไม่ใช่ _p.pak)
-    pak_files = [f for f in os.listdir(paks_dir)
-                 if f.endswith('.pak') and not f.endswith('_p.pak')]
+    # หา pak ต้นฉบับก่อน ถ้าไม่มีให้ใช้ _p.pak
+    all_paks = sorted(f for f in os.listdir(paks_dir) if f.endswith('.pak'))
+    pak_files = [f for f in all_paks if not f.endswith('_p.pak')]
+    if not pak_files:
+        pak_files = all_paks   # fallback: ใช้ทุก pak รวม _p.pak
     if not pak_files:
         log("ไม่พบ pak file")
         return results
@@ -390,11 +392,12 @@ def _extract_ue4(game_dir: str, log) -> list[GameString]:
         log(f"ไม่สามารถอ่าน pak: {e}")
         return results
 
-    # หาไฟล์ .locres สำหรับภาษา en หรือ zh-Hans
-    locres_files = [f for f in files
-                    if f.endswith('.locres')
-                    and ('/en/' in f or '/zh-Hans/' in f or '/zh-CN/' in f)]
-    log(f"พบ {len(locres_files)} locres files")
+    # หาไฟล์ .locres — prefer zh-Hans (Chinese source) ถ้ามี ไม่งั้นใช้ en
+    zh_files = [f for f in files if f.endswith('.locres')
+                and ('/zh-Hans/' in f or '/zh-CN/' in f or '/zh-Hant/' in f)]
+    en_files  = [f for f in files if f.endswith('.locres') and '/en/' in f]
+    locres_files = zh_files if zh_files else en_files
+    log(f"พบ {len(locres_files)} locres files ({'zh-Hans' if zh_files else 'en'})")
 
     for fpath in locres_files:
         try:

@@ -8,6 +8,12 @@ from dataclasses import dataclass, field
 LOCRES_MAGIC_1 = 0x7574F4CF
 LOCRES_MAGIC_2 = 0x4B4946A4
 
+# Newer UE4 locres: 16-byte magic (compact format)
+LOCRES_MAGIC_COMPACT = bytes([
+    0x0E, 0x14, 0x74, 0x75, 0x67, 0x4A, 0x03, 0xFC,
+    0x4A, 0x15, 0x90, 0x9D, 0xC3, 0x37, 0x7F, 0x1B,
+])
+
 @dataclass
 class LocresEntry:
     namespace: str
@@ -59,12 +65,58 @@ def _crc32_ci(s: str) -> int:
     return binascii.crc32(s.upper().encode('utf-16-le')) & 0xFFFFFFFF
 
 
+def _load_compact(data: bytes) -> 'LocresFile':
+    """Parse newer compact locres format (16-byte magic, version 3)."""
+    lf = LocresFile()
+    pos = 16
+    lf.version = data[pos]; pos += 1
+
+    # uint64: byte offset to string pool
+    str_pool_offset = struct.unpack_from('<Q', data, pos)[0]; pos += 8
+    # int32: total entry count (skip — just informational)
+    pos += 4
+
+    # Read string pool at offset
+    sp = str_pool_offset
+    str_count = struct.unpack_from('<i', data, sp)[0]; sp += 4
+    strings: list[str] = []
+    for _ in range(str_count):
+        s, sp = _read_fstring(data, sp)
+        sp += 4  # skip per-string hash
+        strings.append(s)
+
+    # Read namespace table
+    ns_count = struct.unpack_from('<i', data, pos)[0]; pos += 4
+    for _ in range(ns_count):
+        ns_hash  = struct.unpack_from('<I', data, pos)[0]; pos += 4
+        namespace, pos = _read_fstring(data, pos)
+        entry_count = struct.unpack_from('<i', data, pos)[0]; pos += 4
+
+        for _ in range(entry_count):
+            key_hash  = struct.unpack_from('<I', data, pos)[0]; pos += 4
+            key, pos  = _read_fstring(data, pos)
+            pos += 4  # source string hash (always present in compact format)
+            str_idx   = struct.unpack_from('<i', data, pos)[0]; pos += 4
+
+            translation = strings[str_idx] if 0 <= str_idx < len(strings) else ""
+            lf.entries.append(LocresEntry(
+                namespace=namespace, key=key,
+                translation=translation,
+                key_hash=key_hash, ns_hash=ns_hash,
+            ))
+    return lf
+
+
 def load(data: bytes) -> LocresFile:
     """Parse .locres binary data → LocresFile"""
     pos = 0
     lf = LocresFile()
 
-    # Magic
+    # Check new 16-byte compact magic first
+    if len(data) >= 16 and data[:16] == LOCRES_MAGIC_COMPACT:
+        return _load_compact(data)
+
+    # Legacy 4-byte magic
     m1 = struct.unpack_from('<I', data, pos)[0]; pos += 4
     if m1 != LOCRES_MAGIC_1:
         raise ValueError(f"Bad magic: {m1:#010x}")
