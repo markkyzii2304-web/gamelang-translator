@@ -38,6 +38,8 @@ def extract_all(game_dir: str, engine: str,
         return _extract_renpy(game_dir, log)
     elif "unity" in e:
         return _extract_localization(game_dir, log)
+    elif "unreal" in e:
+        return _extract_ue4(game_dir, log)
     else:
         return _extract_generic(game_dir, log)
 
@@ -358,6 +360,67 @@ def _extract_localization(game_dir: str, log) -> list[GameString]:
             log(f"  skip {os.path.basename(fpath)}: {e}")
 
     log(f"Localization: total {len(results)} strings")
+    return results
+
+
+def _extract_ue4(game_dir: str, log) -> list[GameString]:
+    """Extract from UE4 .pak files via .locres parsing"""
+    from core.pak_handler import list_files, extract_file
+    from core import locres as locres_mod
+    results: list[GameString] = []
+
+    paks_dir = os.path.join(game_dir, "Content", "Paks")
+    if not os.path.isdir(paks_dir):
+        log("ไม่พบ Content/Paks — ไม่ใช่ UE4 game")
+        return results
+
+    # หา pak ต้นฉบับ (ไม่ใช่ _p.pak)
+    pak_files = [f for f in os.listdir(paks_dir)
+                 if f.endswith('.pak') and not f.endswith('_p.pak')]
+    if not pak_files:
+        log("ไม่พบ pak file")
+        return results
+
+    main_pak = os.path.join(paks_dir, pak_files[0])
+    log(f"UE4 pak: {pak_files[0]}")
+
+    try:
+        files = list_files(main_pak)
+    except Exception as e:
+        log(f"ไม่สามารถอ่าน pak: {e}")
+        return results
+
+    # หาไฟล์ .locres สำหรับภาษา en หรือ zh-Hans
+    locres_files = [f for f in files
+                    if f.endswith('.locres')
+                    and ('/en/' in f or '/zh-Hans/' in f or '/zh-CN/' in f)]
+    log(f"พบ {len(locres_files)} locres files")
+
+    for fpath in locres_files:
+        try:
+            raw = extract_file(main_pak, fpath)
+            if not raw:
+                continue
+            lf  = locres_mod.load(raw)
+            d   = locres_mod.to_dict(lf)
+            rel = fpath.replace('\\', '/')
+            before = len(results)
+            for ns, keys in d.items():
+                for key, translation in keys.items():
+                    if _is_translatable(translation):
+                        results.append(GameString(
+                            id=f"{rel}::{ns}::{key}",
+                            text=translation,
+                            file=rel,
+                            location=ns or "ui",
+                        ))
+            count = len(results) - before
+            if count:
+                log(f"  {os.path.basename(fpath)}: {count} strings")
+        except Exception as e:
+            log(f"  ข้าม {os.path.basename(fpath)}: {e}")
+
+    log(f"UE4: รวม {len(results)} strings")
     return results
 
 

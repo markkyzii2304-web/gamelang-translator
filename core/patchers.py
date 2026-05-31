@@ -418,6 +418,71 @@ class OverlayPatcher(BasePatcher):
                 "หมายเหตุ: ไม่มีตัวเลือกใน Settings เกม แต่เห็นคำแปลไทยบนหน้าจอ")
 
 
+# ── 6. UE4 Pak Patcher ───────────────────────────────────────────────────────
+class UE4PakPatcher:
+    """
+    สร้าง _p.pak ที่มี .locres ภาษาไทย สำหรับ UE4 games
+    """
+    def __init__(self, game_dir: str, game_name: str,
+                 glpack, progress=None, rollback_mgr=None):
+        self.game_dir    = game_dir
+        self.game_name   = game_name
+        self.glpack      = glpack
+        self.log         = progress or (lambda m: None)
+        self.rollback_mgr = rollback_mgr
+
+    def apply(self) -> str:
+        from core import locres as locres_mod
+        from core.pak_handler import list_files, extract_file, create_patch_pak
+        import re
+
+        paks_dir = os.path.join(self.game_dir, "Content", "Paks")
+        pak_files = [f for f in os.listdir(paks_dir)
+                     if f.endswith('.pak') and '_p' not in f]
+        if not pak_files:
+            return "ไม่พบ pak file"
+
+        main_pak = os.path.join(paks_dir, pak_files[0])
+        self.log(f"อ่าน pak: {pak_files[0]}")
+
+        # Group glpack entries by locres file
+        file_map: dict[str, dict[str, dict[str, str]]] = {}
+        for entry in self.glpack.strings.values():
+            # entry.file format: "path/to/en/UI.locres"
+            th_file = re.sub(r'/(en|zh-Hans|zh-CN|zh-Hant)/', '/th/', entry.file)
+            parts = entry.id.split('::')
+            if len(parts) >= 3:
+                ns  = parts[1]
+                key = parts[2]
+                file_map.setdefault(th_file, {}).setdefault(ns, {})[key] = entry.translated
+
+        if not file_map:
+            return "ไม่มี UE4 locres entries ใน glpack"
+
+        # Build new .locres files
+        patch_files: dict[str, bytes] = {}
+        for th_file, ns_dict in file_map.items():
+            lf  = locres_mod.from_dict(ns_dict, version=3)
+            raw = locres_mod.dump(lf, version=3)
+            patch_files[th_file] = raw
+            self.log(f"  {os.path.basename(th_file)}: {sum(len(v) for v in ns_dict.values())} strings")
+
+        # Create _p.pak
+        game_id   = self.game_name.lower().replace(" ", "_")
+        pak_name  = f"{game_id}_thai_p.pak"
+        out_path  = os.path.join(paks_dir, pak_name)
+
+        if self.rollback_mgr and os.path.exists(out_path):
+            self.rollback_mgr.backup_file(out_path)
+
+        create_patch_pak(out_path, patch_files)
+        self.log(f"สร้าง {pak_name} ({len(patch_files)} locres files)")
+
+        return (f"UE4 Patch สำเร็จ: {pak_name}\n"
+                f"วางไว้ใน Content/Paks/ แล้ว\n"
+                f"เปิดเกม → Settings → Language → Thai")
+
+
 # ── Factory ───────────────────────────────────────────────────────────────────
 def get_patcher(method, game_dir, game_name, translation, no_translate,
                 progress=None, rollback_mgr=None):
