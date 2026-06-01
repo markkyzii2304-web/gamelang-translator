@@ -766,6 +766,240 @@ def _md_to_simple(text: str) -> str:
     return text.strip()
 
 
+# ── Community Pack Store Dialog ───────────────────────────────────────────────
+class PackStoreDialog(QDialog):
+    """
+    Community Pack Store — แสดงและดาวน์โหลด .glpack จาก GitHub
+    fetch manifest เอง เปิดได้เลยโดยไม่ต้องมีเกมใน library ก่อน
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._workers: dict = {}   # game_id → PackDownloadWorker
+        self._rows:    dict = {}   # game_id → {btn, lbl, bar}
+
+        self.setWindowTitle("Community Packs")
+        self.setMinimumWidth(540)
+        self.setMinimumHeight(320)
+        self.setStyleSheet(
+            f"QDialog{{background:{NV_BG};border:1px solid {NV_BORDER};}}"
+            f"QLabel{{color:{NV_TEXT};}}"
+            f"QScrollArea{{background:transparent;border:none;}}"
+            f"QScrollBar:vertical{{background:transparent;width:4px;}}"
+            f"QScrollBar::handle:vertical{{background:#2a2a50;border-radius:2px;}}"
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 16)
+        root.setSpacing(12)
+
+        # Header
+        hdr = QLabel("COMMUNITY PACKS")
+        hdr.setStyleSheet(
+            f"color:{NV_CYAN};font-size:12px;font-weight:bold;letter-spacing:3px;"
+        )
+        root.addWidget(hdr)
+
+        sub = QLabel(
+            "ดาวน์โหลดไฟล์แปลสำเร็จรูปจากชุมชน  —  "
+            "ไม่ต้องใช้ API key  —  แค่กด PATCH GAME"
+        )
+        sub.setStyleSheet(f"color:{NV_MUTED};font-size:11px;")
+        root.addWidget(sub)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color:{NV_BORDER};"); root.addWidget(sep)
+
+        # Scrollable pack list
+        self._list_widget = QWidget()
+        self._list_layout = QVBoxLayout(self._list_widget)
+        self._list_layout.setContentsMargins(0, 0, 0, 0)
+        self._list_layout.setSpacing(8)
+
+        self._status_lbl = QLabel("⟳  กำลังโหลด...")
+        self._status_lbl.setStyleSheet(
+            f"color:{NV_MUTED};font-size:12px;padding:20px;"
+        )
+        self._status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._list_layout.addWidget(self._status_lbl)
+
+        scroll = QScrollArea()
+        scroll.setWidget(self._list_widget)
+        scroll.setWidgetResizable(True)
+        scroll.setFixedHeight(260)
+        root.addWidget(scroll)
+
+        # Footer buttons
+        foot = QHBoxLayout(); foot.setSpacing(8)
+        self._refresh_btn = QPushButton("⟳  Refresh")
+        self._refresh_btn.setFixedWidth(100)
+        self._refresh_btn.clicked.connect(self._fetch)
+        foot.addWidget(self._refresh_btn)
+        foot.addStretch()
+        close_btn = QPushButton("ปิด")
+        close_btn.setFixedWidth(80)
+        close_btn.clicked.connect(self.accept)
+        foot.addWidget(close_btn)
+        root.addLayout(foot)
+
+        # Auto-fetch on open
+        self._fetch()
+
+    # ── Fetch ──────────────────────────────────────────────────────────────────
+    def _fetch(self):
+        self._refresh_btn.setEnabled(False)
+        self._status_lbl.setText("⟳  กำลังโหลดรายการ pack...")
+        self._status_lbl.setVisible(True)
+        from core.pack_store import PackFetchWorker
+        w = PackFetchWorker()
+        w.finished.connect(self._on_fetched)
+        w.start()
+        self._fetch_worker = w
+
+    def _on_fetched(self, manifest: list):
+        self._refresh_btn.setEnabled(True)
+        # Clear old rows
+        for i in reversed(range(self._list_layout.count())):
+            item = self._list_layout.itemAt(i)
+            if item and item.widget():
+                item.widget().deleteLater()
+        self._rows.clear()
+
+        if not manifest:
+            self._status_lbl = QLabel(
+                "ไม่พบ pack ที่พร้อมใช้งาน\n"
+                "อาจเกิดจาก network error หรือยังไม่มีการอัปโหลด"
+            )
+            self._status_lbl.setStyleSheet(
+                f"color:{NV_MUTED};font-size:12px;padding:20px;"
+            )
+            self._status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._list_layout.addWidget(self._status_lbl)
+            return
+
+        self._status_lbl.setVisible(False)
+        for pack in manifest:
+            self._list_layout.addWidget(self._make_row(pack))
+        self._list_layout.addStretch()
+
+    # ── Pack row ───────────────────────────────────────────────────────────────
+    def _make_row(self, pack) -> QWidget:
+        frame = QFrame()
+        frame.setStyleSheet(
+            f"QFrame{{background:{NV_PANEL};border:1px solid {NV_BORDER};"
+            f"border-radius:2px;}}"
+        )
+        row = QHBoxLayout(frame)
+        row.setContentsMargins(14, 10, 10, 10)
+        row.setSpacing(10)
+
+        # Info
+        info_lay = QVBoxLayout(); info_lay.setSpacing(2)
+        name_lbl = QLabel(f"<b>{pack.game_name}</b>")
+        name_lbl.setStyleSheet(f"color:{NV_TEXT};font-size:13px;background:transparent;border:none;")
+        size_info = size_str(pack.size_bytes) if pack.size_bytes else ""
+        meta_lbl = QLabel(
+            f"Thai  ·  {pack.string_count:,} strings"
+            + (f"  ·  {size_info}" if size_info else "")
+            + f"  ·  v{pack.pack_version}"
+        )
+        meta_lbl.setStyleSheet(f"color:{NV_MUTED};font-size:10px;background:transparent;border:none;")
+        info_lay.addWidget(name_lbl)
+        info_lay.addWidget(meta_lbl)
+        row.addLayout(info_lay, 1)
+
+        # Status label
+        status_lbl = QLabel("")
+        status_lbl.setStyleSheet(
+            f"color:{NV_GREEN};font-size:10px;background:transparent;border:none;"
+        )
+        row.addWidget(status_lbl)
+
+        # Progress bar
+        prog = QProgressBar()
+        prog.setFixedSize(90, 6)
+        prog.setRange(0, 100)
+        prog.setValue(0)
+        prog.setVisible(False)
+        prog.setStyleSheet(
+            f"QProgressBar{{background:#14142a;border:1px solid #1e1e38;border-radius:2px;}}"
+            f"QProgressBar::chunk{{background:{NV_CYAN};}}"
+        )
+        row.addWidget(prog)
+
+        # Button
+        local_path = os.path.join(GLPACK_DIR, f"{pack.game_id}.glpack")
+        if os.path.exists(local_path):
+            btn = QPushButton("✓  DOWNLOADED")
+            btn.setEnabled(False)
+            sz = os.path.getsize(local_path)
+            status_lbl.setText(f"✓  {size_str(sz)}")
+        else:
+            btn = QPushButton("⬇  DOWNLOAD")
+            btn.clicked.connect(
+                lambda _checked, p=pack, b=btn, sl=status_lbl, pr=prog:
+                self._start_dl(p, b, sl, pr)
+            )
+
+        btn.setFixedSize(130, 30)
+        row.addWidget(btn)
+
+        self._rows[pack.game_id] = {"btn": btn, "lbl": status_lbl, "bar": prog}
+        return frame
+
+    # ── Download ───────────────────────────────────────────────────────────────
+    def _start_dl(self, pack, btn, status_lbl, prog):
+        btn.setEnabled(False)
+        btn.setText("⟳  DOWNLOADING...")
+        prog.setValue(0)
+        prog.setVisible(True)
+        status_lbl.setText("")
+
+        from core.pack_store import PackDownloadWorker
+        w = PackDownloadWorker(pack)
+        w.progress.connect(
+            lambda dl, tot, pr=prog, sl=status_lbl:
+            self._on_dl_progress(dl, tot, pr, sl)
+        )
+        w.finished.connect(
+            lambda path, b=btn, sl=status_lbl, pr=prog:
+            self._on_dl_done(path, b, sl, pr)
+        )
+        w.error.connect(
+            lambda msg, b=btn, sl=status_lbl:
+            self._on_dl_error(msg, b, sl)
+        )
+        w.start()
+        self._workers[pack.game_id] = w
+
+    def _on_dl_progress(self, dl: int, tot: int, prog, lbl):
+        if tot > 0:
+            prog.setValue(int(dl / tot * 100))
+            lbl.setText(f"{size_str(dl)} / {size_str(tot)}")
+        else:
+            lbl.setText(size_str(dl))
+
+    def _on_dl_done(self, path: str, btn, lbl, prog):
+        prog.setVisible(False)
+        if path and os.path.exists(path):
+            btn.setText("✓  DOWNLOADED")
+            btn.setEnabled(False)
+            sz = os.path.getsize(path)
+            lbl.setText(f"✓  {size_str(sz)}")
+            lbl.setStyleSheet(f"color:{NV_GREEN};font-size:10px;background:transparent;border:none;")
+        else:
+            btn.setText("⬇  DOWNLOAD")
+            btn.setEnabled(True)
+            lbl.setText("⚠ ล้มเหลว ลองอีกครั้ง")
+            lbl.setStyleSheet(f"color:{NV_RED};font-size:10px;background:transparent;border:none;")
+
+    def _on_dl_error(self, msg: str, btn, lbl):
+        btn.setText("⬇  DOWNLOAD")
+        btn.setEnabled(True)
+        lbl.setText(f"⚠ {msg[:50]}")
+        lbl.setStyleSheet(f"color:{NV_RED};font-size:10px;background:transparent;border:none;")
+
+
 # ── Main Window ───────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -945,6 +1179,19 @@ class MainWindow(QMainWindow):
         )
         fl.addWidget(self._lib_count_lbl, 1)
 
+        # Pack Store button
+        store_btn = QPushButton("📦")
+        store_btn.setFixedSize(28, 28)
+        store_btn.setToolTip("Community Packs — ดาวน์โหลดไฟล์แปลสำเร็จรูป")
+        store_btn.setStyleSheet(
+            f"QPushButton{{background:rgba(56,189,248,0.06);border:1px solid #1e3040;"
+            f"color:#4080a0;border-radius:2px;font-size:13px;}}"
+            f"QPushButton:hover{{border-color:{NV_CYAN};color:{NV_CYAN};"
+            f"background:rgba(56,189,248,0.15);}}"
+        )
+        store_btn.clicked.connect(self._open_pack_store)
+        fl.addWidget(store_btn)
+
         add_btn = QPushButton("＋")
         add_btn.setFixedSize(28, 28)
         add_btn.setToolTip("เพิ่มเกมจากโฟลเดอร์")
@@ -972,6 +1219,24 @@ class MainWindow(QMainWindow):
 
     def _update_library_count(self):
         self._lib_count_lbl.setText(f"  {self.game_list.count()} GAMES")
+
+    def _open_pack_store(self):
+        """เปิด Community Pack Store dialog"""
+        dlg = PackStoreDialog(parent=self)
+        dlg.exec()
+        # หลัง dialog ปิด — ตรวจสอบว่ามี glpack ใหม่ดาวน์โหลดมาไหม
+        if self.selected_game:
+            _gid = self.selected_game["name"].lower().replace(" ", "_")
+            _lp  = os.path.join(GLPACK_DIR, f"{_gid}.glpack")
+            if os.path.exists(_lp) and not self._glpack_path:
+                self._glpack_path = _lp
+                self.patch_btn.setEnabled(bool(self.game_dir))
+                self._update_stats()
+                self.prog_log.setText(
+                    "✓ Thai Pack พร้อมแล้ว — กด ⚡ PATCH GAME ได้เลย"
+                )
+        # Refresh manifest + banner
+        self._fetch_pack_manifest()
 
     def _on_add_game(self):
         """ผู้ใช้กด ＋ → เลือกโฟลเดอร์ → detect engine → เพิ่มใน library ถ้าเจอ"""
@@ -1333,7 +1598,14 @@ class MainWindow(QMainWindow):
         if self.game_dir:
             self._run_engine_detect()
 
-        # Show community pack banner if available
+        # Auto-enable patch ถ้ามี .glpack ในเครื่องอยู่แล้ว (ไม่ต้องรอ manifest)
+        _gid = self.selected_game["name"].lower().replace(" ", "_")
+        _lp  = os.path.join(GLPACK_DIR, f"{_gid}.glpack")
+        if os.path.exists(_lp):
+            self._glpack_path = _lp
+            self.patch_btn.setEnabled(bool(self.game_dir))
+
+        # Show community pack banner if available (manifest-based)
         self._check_community_pack()
 
         # Auto-scan game context (non-blocking background)
@@ -1514,13 +1786,8 @@ class MainWindow(QMainWindow):
         self.pack_frame.setVisible(True)
 
     def _on_download_pack(self):
-        """Start downloading community pack"""
+        """Start downloading community pack (ไม่ต้องการ game_dir — download เก็บก่อนได้)"""
         if not self._current_pack:
-            return
-        if not self.game_dir:
-            from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.warning(self, "ข้อผิดพลาด",
-                                "กรุณาเลือกโฟลเดอร์เกมก่อน")
             return
 
         self.pack_dl_btn.setText("⟳  DOWNLOADING...")
@@ -1534,7 +1801,7 @@ class MainWindow(QMainWindow):
         w = PackDownloadWorker(self._current_pack)
         w.progress.connect(self._on_pack_dl_progress)
         w.finished.connect(self._on_pack_dl_done)
-        w.error.connect(lambda msg: self.prog_log.setText(f"⚠ Download ล้มเหลว: {msg}"))
+        w.error.connect(self._on_pack_dl_error)
         w.start()
         self._pack_dl_worker = w
 
@@ -1548,21 +1815,26 @@ class MainWindow(QMainWindow):
         else:
             self.prog_log.setText(f"กำลังดาวน์โหลด {size_str(downloaded)}...")
 
+    def _on_pack_dl_error(self, msg: str):
+        """Download error — re-enable UI"""
+        self._set_busy(False)
+        self.prog_bar.setVisible(False)
+        self.pack_dl_btn.setText("⬇  DOWNLOAD THAI PACK")
+        self.pack_dl_btn.setEnabled(True)
+        self.prog_log.setText(f"⚠ Download ล้มเหลว: {msg}")
+        self._update_stats()
+
     def _on_pack_dl_done(self, local_path: str):
+        self._set_busy(False)   # คืนสถานะปุ่มทุกตัวก่อน
         self.prog_bar.setRange(0, 100)
         self.prog_bar.setValue(100)
         QTimer.singleShot(600, lambda: self.prog_bar.setVisible(False))
-
-        self.extract_btn.setEnabled(bool(self.game_dir))
-        pass  # scan context runs automatically
-        self.translate_btn.setEnabled(bool(self._extracted))
-        self.rollback_btn.setEnabled(False)
 
         if local_path and os.path.exists(local_path):
             self._glpack_path = local_path
             self.patch_btn.setEnabled(bool(self.game_dir))
             self.prog_log.setText(
-                f"✓ Thai Pack พร้อมแล้ว — กด ⚡ PATCH GAME ได้เลย"
+                "✓ Thai Pack พร้อมแล้ว — กด ⚡ PATCH GAME ได้เลย"
             )
             # Update banner
             if self._current_pack:
@@ -1580,6 +1852,7 @@ class MainWindow(QMainWindow):
             self.patch_btn.setEnabled(False)
             self.pack_dl_btn.setText("⬇  DOWNLOAD THAI PACK")
             self.pack_dl_btn.setEnabled(True)
+            self._update_stats()
 
     # ── Stage 1: Scan context (auto — ไม่มีปุ่ม) ────────────────────────────
     def _on_scan_context(self):
