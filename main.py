@@ -888,15 +888,15 @@ class MainWindow(QMainWindow):
             b = QPushButton(sym); b.setFixedSize(36, 46)
             b.setStyleSheet(
                 f"QPushButton{{background:transparent;border:none;"
-                f"color:#252545;font-size:13px;font-weight:300;"
+                f"color:#5a6090;font-size:14px;font-weight:400;"
                 f"border-radius:0;}}"
-                f"QPushButton:hover{{background:rgba(255,255,255,0.05);"
+                f"QPushButton:hover{{background:rgba(255,255,255,0.07);"
                 f"color:{hover_c};}}"
             )
             if sym == "✕":
                 b.setStyleSheet(
                     f"QPushButton{{background:transparent;border:none;"
-                    f"color:#252545;font-size:12px;font-weight:300;"
+                    f"color:#5a6090;font-size:13px;font-weight:400;"
                     f"border-radius:0;}}"
                     f"QPushButton:hover{{background:rgba(240,98,146,0.18);"
                     f"color:{NV_RED};}}"
@@ -941,7 +941,7 @@ class MainWindow(QMainWindow):
 
         self._lib_count_lbl = QLabel(f"  {len(self._library)} GAMES")
         self._lib_count_lbl.setStyleSheet(
-            "color:#2a3a2a;font-size:9px;letter-spacing:2px;"
+            f"color:{NV_MUTED};font-size:9px;letter-spacing:2px;"
         )
         fl.addWidget(self._lib_count_lbl, 1)
 
@@ -949,10 +949,10 @@ class MainWindow(QMainWindow):
         add_btn.setFixedSize(28, 28)
         add_btn.setToolTip("เพิ่มเกมจากโฟลเดอร์")
         add_btn.setStyleSheet(
-            f"QPushButton{{background:transparent;border:1px solid #1e2456;"
-            f"color:{NV_MUTED};border-radius:2px;font-size:13px;font-weight:bold;}}"
+            f"QPushButton{{background:rgba(91,141,238,0.08);border:1px solid #3a4480;"
+            f"color:#8899cc;border-radius:2px;font-size:14px;font-weight:bold;}}"
             f"QPushButton:hover{{border-color:{NV_GREEN};color:{NV_GREEN};"
-            f"background:rgba(91,141,238,0.1);}}"
+            f"background:rgba(91,141,238,0.18);}}"
         )
         add_btn.clicked.connect(self._on_add_game)
         fl.addWidget(add_btn)
