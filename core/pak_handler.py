@@ -360,17 +360,43 @@ def extract_file(pak_path: str, target_filename: str) -> bytes | None:
     return raw
 
 
+def _pak_fstring(text: str) -> bytes:
+    """
+    Encode a UE4 FString for pak index.
+    ASCII/Latin-1 → positive length + bytes + null
+    Non-ASCII (e.g. Chinese filenames) → negative length + UTF-16-LE + null
+    """
+    try:
+        encoded = (text + '\x00').encode('latin-1')
+        return struct.pack('<i', len(encoded)) + encoded
+    except (UnicodeEncodeError, ValueError):
+        encoded = (text + '\x00').encode('utf-16-le')
+        char_count = -(len(encoded) // 2)   # negative = UTF-16
+        return struct.pack('<i', char_count) + encoded
+
+
+PAK_VERSION_V8 = 8   # v8 uses 204-byte footer — compatible with UE4 4.20–4.27
+
+
 def create_patch_pak(output_path: str,
                      files: dict[str, bytes],
                      mount_point: str = "../../../") -> None:
     """
-    Create a _p.pak patch file (uncompressed, UE4 v3 format — exactly 44-byte footer).
+    Create a _p.pak patch file (uncompressed, UE4 v8 format).
+
+    v8 is used because:
+    - v3 footer is 44 bytes but UE4 4.27 scans for 204-byte footer first
+    - v8 footer is 204 bytes → always found on first scan attempt
+    - Same FString-based index as v3, just different footer structure
+    - Chinese/non-ASCII filenames encoded as UTF-16-LE (negative FString length)
 
     Per-file header layout (53 bytes, no compression):
         Offset(8) + Size(8) + UncompressedSize(8) + CompressionMethod(4)
         + Hash(20) + BlockCount(4) + Flags(1)
-    The index entry mirrors the same layout.
-    Footer = magic(4) + version(4) + idx_offset(8) + idx_size(8) + sha1(20) = 44 bytes.
+    Footer layout (204 bytes):
+        Magic(4) + Version(4) + IndexOffset(8) + IndexSize(8) + IndexHash(20)
+        + bEncryptedIndex(1) + EncryptionKeyGuid(16) + CompressionMethods(5×32+4 each) ...
+        padded to 204 bytes total.
     """
     entries_meta = []
     data_buf = bytearray()
@@ -378,56 +404,60 @@ def create_patch_pak(output_path: str,
     for fname, content in files.items():
         sha1       = hashlib.sha1(content).digest()
         fsize      = len(content)
-        file_start = len(data_buf)  # absolute offset of per-file header
+        file_start = len(data_buf)
 
-        # Per-file header — 53 bytes, correct UE4 v3 field order
+        # Per-file header — 53 bytes (same for all pak versions)
         header = bytearray()
         header += struct.pack('<q', file_start)   # Offset (self-referential)
-        header += struct.pack('<q', fsize)         # Size (compressed == uncompressed)
+        header += struct.pack('<q', fsize)         # Size
         header += struct.pack('<q', fsize)         # UncompressedSize
         header += struct.pack('<I', 0)             # CompressionMethod = NONE
-        header += sha1                             # Hash — SHA1 of raw content (20 bytes)
-        header += struct.pack('<I', 0)             # CompressionBlocks count = 0
-        header += b'\x00'                          # Flags (bEncrypted = false)
-        # CompressionBlockSize omitted — only present when method != 0
+        header += sha1                             # Hash (20 bytes)
+        header += struct.pack('<I', 0)             # BlockCount = 0
+        header += b'\x00'                          # Flags (not encrypted)
 
-        data_buf += header   # exactly 53 bytes
+        data_buf += header   # 53 bytes
         data_buf += content
         entries_meta.append((fname, file_start, fsize, sha1))
 
-    # Build index — each entry mirrors the per-file header layout
+    # Build index — FString-based (same as v3, used by v8 too)
     index = bytearray()
-    mp_enc = (mount_point + '\x00').encode('latin-1')
-    index += struct.pack('<i', len(mp_enc))
-    index += mp_enc
-    index += struct.pack('<i', len(entries_meta))
+    index += _pak_fstring(mount_point)            # mount point
+    index += struct.pack('<i', len(entries_meta)) # file count
 
     for fname, file_start, fsize, sha1 in entries_meta:
-        fn_enc = (fname + '\x00').encode('latin-1')
-        index += struct.pack('<i', len(fn_enc))
-        index += fn_enc
-        index += struct.pack('<q', file_start)     # Offset = start of per-file header
-        index += struct.pack('<q', fsize)
-        index += struct.pack('<q', fsize)
-        index += struct.pack('<I', 0)               # CompressionMethod = NONE
-        index += sha1                               # Hash (20 bytes)
-        index += struct.pack('<I', 0)               # BlockCount = 0
-        index += b'\x00'                            # Flags
+        index += _pak_fstring(fname)              # filename (UTF-16 if non-ASCII)
+        index += struct.pack('<q', file_start)    # Offset
+        index += struct.pack('<q', fsize)         # Size
+        index += struct.pack('<q', fsize)         # UncompressedSize
+        index += struct.pack('<I', 0)             # CompressionMethod = NONE
+        index += sha1                             # Hash (20 bytes)
+        index += struct.pack('<I', 0)             # BlockCount = 0
+        index += b'\x00'                          # Flags
 
     idx_offset = len(data_buf)
     idx_sha1   = hashlib.sha1(index).digest()
 
-    # UE4 v3 footer = exactly 44 bytes (NOT 48 — no padding!)
-    # magic(4) + version(4) + idx_offset(8) + idx_size(8) + sha1(20)
-    footer = bytearray()
-    footer += struct.pack('<I', PAK_MAGIC)
-    footer += struct.pack('<I', PAK_VERSION)   # = 3
-    footer += struct.pack('<q', idx_offset)
-    footer += struct.pack('<q', len(index))
-    footer += idx_sha1
+    # UE4 v8 footer = 204 bytes
+    # magic(4) + version(4) + IndexOffset(8) + IndexSize(8) + IndexHash(20) = 44 bytes
+    # + bEncryptedIndex(1) + padding(3) + EncryptionKeyGuid(4+16=20) = 24 bytes
+    # + 5 compression method names (each: uint32 len + 32 bytes name) = 5×(4+32) = 180 bytes
+    # → but original UE4 v8 is simpler: 44 + (204-44) extra padding fields = 204 bytes
+    # Use fixed 204-byte footer with correct magic/version/index fields,
+    # padding remaining fields with zeros (not encrypted, no custom compression).
+    footer = bytearray(204)
+    struct.pack_into('<I', footer, 0,  PAK_MAGIC)         # Magic
+    struct.pack_into('<I', footer, 4,  PAK_VERSION_V8)    # Version = 8
+    struct.pack_into('<q', footer, 8,  idx_offset)        # IndexOffset
+    struct.pack_into('<q', footer, 16, len(index))        # IndexSize
+    footer[24:44] = idx_sha1                              # IndexHash (20 bytes)
+    # bytes 44–203 remain zero:
+    #   [44]   bEncryptedIndex = 0 (not encrypted)
+    #   [45–60] EncryptionKeyGuid = 0 (no encryption key)
+    #   [61–200] CompressionMethods names = empty strings (zeros = len 0 each)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, 'wb') as f:
         f.write(data_buf)
         f.write(index)
-        f.write(footer)
+        f.write(bytes(footer))
