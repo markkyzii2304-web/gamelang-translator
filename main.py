@@ -1498,12 +1498,21 @@ class MainWindow(QMainWindow):
         self.delete_pack_btn.setEnabled(not busy)
         # pack_dl_btn is managed separately (already disabled when downloading)
 
+    def _pack_string_count(self) -> int:
+        """จำนวน strings — อ่านจาก glpack ก่อน fallback ไป _extracted"""
+        if self._glpack_path and os.path.exists(self._glpack_path):
+            try:
+                return len(GLPackReader.load(self._glpack_path).strings)
+            except Exception:
+                pass
+        return len(self._extracted)
+
     def _update_stats(self):
         self._clear_layout(self.stats_row)
         # enable delete ถ้ามีไฟล์ .glpack
         has_pack = bool(self._glpack_path and os.path.exists(self._glpack_path))
         self.delete_pack_btn.setEnabled(has_pack)
-        count = len(self._extracted)
+        count = self._pack_string_count()
         if count:
             self.stats_row.addWidget(
                 self._card("STRINGS", f"{count:,} strings", NV_GREEN)
@@ -2000,7 +2009,7 @@ class MainWindow(QMainWindow):
 
         method = (self.detect_result.method if self.detect_result
                   else PatchMethod.OVERLAY)
-        count  = len(self._extracted)
+        count  = self._pack_string_count()
 
         dlg = WarningDialog(
             self.selected_game["name"], method,
@@ -2052,7 +2061,7 @@ class MainWindow(QMainWindow):
 
         method = (self.detect_result.method if self.detect_result
                   else PatchMethod.OVERLAY)
-        count  = len(self._extracted)
+        count  = self._pack_string_count()
         dlg = PostPatchDialog(
             self.selected_game["name"], method,
             self.game_dir, count, parent=self,
