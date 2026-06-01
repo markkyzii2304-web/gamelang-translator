@@ -506,6 +506,41 @@ class UE4PakPatcher:
             raw = locres_mod.dump(lf, version=3)
             patch_files[loc_file] = raw
 
+        # ── เพิ่ม /en/ locale ──────────────────────────────────────────────────
+        # ผู้เล่นส่วนใหญ่ตั้งเกมเป็น English → UE4 โหลด /en/ locale ไม่ใช่ /zh-Hans/
+        # เขียน Thai text ลงทั้ง zh-Hans AND en เพื่อให้ทำงานได้ทุก language setting
+        extra_patch: dict[str, bytes] = {}
+        for loc_file, raw in list(patch_files.items()):
+            en_file = re.sub(r'/(zh-Hans|zh-CN|zh-Hant)/', '/en/', loc_file)
+            if en_file == loc_file:
+                continue   # path ไม่ใช่ zh-* locale
+
+            # ดึง /en/ original เพื่อ merge (preserve English ที่ไม่ได้แปล)
+            en_dict = None
+            for pf in pak_files:
+                try:
+                    en_data = extract_file(os.path.join(paks_dir, pf), en_file)
+                    if en_data:
+                        en_dict = locres_mod.to_dict(locres_mod.load(en_data))
+                        break
+                except Exception:
+                    pass
+
+            # Merge en original + Thai translations
+            our_dict = locres_mod.to_dict(locres_mod.load(raw))
+            if en_dict:
+                for ns, keys in our_dict.items():
+                    en_dict.setdefault(ns, {}).update(keys)
+                en_lf = locres_mod.from_dict(en_dict, version=3)
+            else:
+                en_lf = locres_mod.from_dict(our_dict, version=3)
+
+            extra_patch[en_file] = locres_mod.dump(en_lf, version=3)
+            self.log(f"  +en/{os.path.basename(en_file)}")
+
+        patch_files.update(extra_patch)
+        self.log(f"locres รวม: {len(patch_files)} files (zh-Hans + en)")
+
         # Create _p.pak
         game_id   = self.game_name.lower().replace(" ", "_")
         pak_name  = f"{game_id}_thai_p.pak"
