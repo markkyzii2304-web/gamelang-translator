@@ -313,16 +313,29 @@ class PatchGlpackWorker(QThread):
 
     def run(self):
         try:
-            from core.patchers import GLPackPatcher
-            pack   = GLPackReader.load(self.glpack_path)
-            patcher = GLPackPatcher(
-                game_dir     = self.game_dir,
-                game_name    = self.game_name,
-                glpack       = pack,
-                method       = self.method,
-                progress     = lambda m: self.progress.emit(m),
-                rollback_mgr = self.rollback_mgr,
-            )
+            pack = GLPackReader.load(self.glpack_path)
+
+            # UE4 pak games: files live inside .pak — use UE4PakPatcher
+            if self.method == PatchMethod.UE4_PAK:
+                from core.patchers import UE4PakPatcher
+                patcher = UE4PakPatcher(
+                    game_dir     = self.game_dir,
+                    game_name    = self.game_name,
+                    glpack       = pack,
+                    progress     = lambda m: self.progress.emit(m),
+                    rollback_mgr = self.rollback_mgr,
+                )
+            else:
+                from core.patchers import GLPackPatcher
+                patcher = GLPackPatcher(
+                    game_dir     = self.game_dir,
+                    game_name    = self.game_name,
+                    glpack       = pack,
+                    method       = self.method,
+                    progress     = lambda m: self.progress.emit(m),
+                    rollback_mgr = self.rollback_mgr,
+                )
+
             result = patcher.apply()
             self.finished.emit(result)
         except Exception as e:
@@ -1493,9 +1506,20 @@ class MainWindow(QMainWindow):
         self.extract_btn.setEnabled(not busy)
         pass  # scan_ctx_btn removed
         self.translate_btn.setEnabled(not busy)
-        self.patch_btn.setEnabled(not busy)
-        self.rollback_btn.setEnabled(not busy)
-        self.delete_pack_btn.setEnabled(not busy)
+        # patch_btn: only enable when not busy AND glpack actually exists
+        if busy:
+            self.patch_btn.setEnabled(False)
+        else:
+            has_pack = bool(self._glpack_path and os.path.exists(self._glpack_path))
+            self.patch_btn.setEnabled(has_pack and bool(self.game_dir))
+        # rollback: check backup state when un-busying
+        if busy:
+            self.rollback_btn.setEnabled(False)
+        else:
+            self._update_rollback_btn()
+        self.delete_pack_btn.setEnabled(
+            (not busy) and bool(self._glpack_path and os.path.exists(self._glpack_path))
+        )
         # pack_dl_btn is managed separately (already disabled when downloading)
 
     def _pack_string_count(self) -> int:
@@ -1903,7 +1927,9 @@ class MainWindow(QMainWindow):
         self.extract_btn.setEnabled(True); self.extract_btn.setText("◈  EXTRACT AGAIN")
         pass  # scan context runs automatically
         self.translate_btn.setEnabled(len(strings) > 0)
-        self.patch_btn.setEnabled(False)
+        # Keep patch enabled if we already have a glpack (community or previous translation)
+        has_pack = bool(self._glpack_path and os.path.exists(self._glpack_path))
+        self.patch_btn.setEnabled(has_pack and bool(self.game_dir))
         self._update_rollback_btn()
 
         count = len(strings)
