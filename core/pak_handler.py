@@ -363,32 +363,39 @@ def extract_file(pak_path: str, target_filename: str) -> bytes | None:
 def create_patch_pak(output_path: str,
                      files: dict[str, bytes],
                      mount_point: str = "../../../") -> None:
-    """Create a _p.pak patch file with given files (uncompressed, v3 format)."""
+    """
+    Create a _p.pak patch file (uncompressed, UE4 v3 format — exactly 44-byte footer).
+
+    Per-file header layout (53 bytes, no compression):
+        Offset(8) + Size(8) + UncompressedSize(8) + CompressionMethod(4)
+        + Hash(20) + BlockCount(4) + Flags(1)
+    The index entry mirrors the same layout.
+    Footer = magic(4) + version(4) + idx_offset(8) + idx_size(8) + sha1(20) = 44 bytes.
+    """
     entries_meta = []
     data_buf = bytearray()
 
     for fname, content in files.items():
-        sha1 = hashlib.sha1(content).digest()
-        fsize = len(content)
+        sha1       = hashlib.sha1(content).digest()
+        fsize      = len(content)
+        file_start = len(data_buf)  # absolute offset of per-file header
 
-        per_header_size = 8 + 8 + 8 + 20 + 4 + 1 + 4   # = 53 bytes (no compression)
-        file_start  = len(data_buf)
-        data_offset = file_start + per_header_size
-
+        # Per-file header — 53 bytes, correct UE4 v3 field order
         header = bytearray()
-        header += struct.pack('<q', data_offset)
-        header += struct.pack('<q', fsize)
-        header += struct.pack('<q', fsize)
-        header += sha1
-        header += struct.pack('<I', 0)   # compression = NONE
-        header += b'\x00'                # not encrypted
-        header += struct.pack('<I', 0)   # block size
+        header += struct.pack('<q', file_start)   # Offset (self-referential)
+        header += struct.pack('<q', fsize)         # Size (compressed == uncompressed)
+        header += struct.pack('<q', fsize)         # UncompressedSize
+        header += struct.pack('<I', 0)             # CompressionMethod = NONE
+        header += sha1                             # Hash — SHA1 of raw content (20 bytes)
+        header += struct.pack('<I', 0)             # CompressionBlocks count = 0
+        header += b'\x00'                          # Flags (bEncrypted = false)
+        # CompressionBlockSize omitted — only present when method != 0
 
-        data_buf += header
+        data_buf += header   # exactly 53 bytes
         data_buf += content
         entries_meta.append((fname, file_start, fsize, sha1))
 
-    # Build index
+    # Build index — each entry mirrors the per-file header layout
     index = bytearray()
     mp_enc = (mount_point + '\x00').encode('latin-1')
     index += struct.pack('<i', len(mp_enc))
@@ -399,24 +406,25 @@ def create_patch_pak(output_path: str,
         fn_enc = (fname + '\x00').encode('latin-1')
         index += struct.pack('<i', len(fn_enc))
         index += fn_enc
-        index += struct.pack('<q', file_start + 53)
+        index += struct.pack('<q', file_start)     # Offset = start of per-file header
         index += struct.pack('<q', fsize)
         index += struct.pack('<q', fsize)
-        index += sha1
-        index += struct.pack('<I', 0)
-        index += b'\x00'
-        index += struct.pack('<I', 0)
+        index += struct.pack('<I', 0)               # CompressionMethod = NONE
+        index += sha1                               # Hash (20 bytes)
+        index += struct.pack('<I', 0)               # BlockCount = 0
+        index += b'\x00'                            # Flags
 
     idx_offset = len(data_buf)
     idx_sha1   = hashlib.sha1(index).digest()
 
+    # UE4 v3 footer = exactly 44 bytes (NOT 48 — no padding!)
+    # magic(4) + version(4) + idx_offset(8) + idx_size(8) + sha1(20)
     footer = bytearray()
     footer += struct.pack('<I', PAK_MAGIC)
-    footer += struct.pack('<I', PAK_VERSION)
+    footer += struct.pack('<I', PAK_VERSION)   # = 3
     footer += struct.pack('<q', idx_offset)
     footer += struct.pack('<q', len(index))
     footer += idx_sha1
-    footer += b'\x00' * 4   # pad to 44 bytes
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, 'wb') as f:

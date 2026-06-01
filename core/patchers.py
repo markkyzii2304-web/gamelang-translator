@@ -459,27 +459,52 @@ class UE4PakPatcher:
         self.log(f"อ่าน pak: {pak_files[0]}")
 
         # Group glpack entries by locres file
+        # ใช้ path ต้นฉบับ (zh-Hans) — game โหลด locale นี้ ไม่ใช่ en
         file_map: dict[str, dict[str, dict[str, str]]] = {}
         for entry in self.glpack.strings.values():
-            # เขียนไปที่ /en/ locale เพราะ Wandering Sword (และ UE4 games ที่ใช้ scheme นี้)
-            # อ่าน en/ locale เพื่อแสดงภาษาไทย (อ้างอิงจาก example patch pak)
-            th_file = re.sub(r'/(zh-Hans|zh-CN|zh-Hant)/', '/en/', entry.file)
+            loc_file = entry.file   # keep original path (zh-Hans/zh-CN/etc.)
             parts = entry.id.split('::')
             if len(parts) >= 3:
                 ns  = parts[1]
                 key = parts[2]
-                file_map.setdefault(th_file, {}).setdefault(ns, {})[key] = entry.translated
+                file_map.setdefault(loc_file, {}).setdefault(ns, {})[key] = entry.translated
 
         if not file_map:
             return "ไม่มี UE4 locres entries ใน glpack"
 
-        # Build new .locres files
+        # Build new .locres files — merge กับ original เพื่อ preserve untranslated strings
         patch_files: dict[str, bytes] = {}
-        for th_file, ns_dict in file_map.items():
-            lf  = locres_mod.from_dict(ns_dict, version=3)
+        for loc_file, ns_dict in file_map.items():
+            # ลองดึง locres ต้นฉบับจากทุก pak (เพื่อ merge)
+            orig_data = None
+            for pf in pak_files:
+                try:
+                    orig_data = extract_file(os.path.join(paks_dir, pf), loc_file)
+                    if orig_data:
+                        break
+                except Exception:
+                    pass
+
+            if orig_data:
+                try:
+                    orig_lf   = locres_mod.load(orig_data)
+                    orig_dict = locres_mod.to_dict(orig_lf)
+                    # override เฉพาะ keys ที่แปลแล้ว ส่วนที่เหลือใช้ต้นฉบับ
+                    for ns, keys in ns_dict.items():
+                        orig_dict.setdefault(ns, {}).update(keys)
+                    lf = locres_mod.from_dict(orig_dict, version=3)
+                    self.log(f"  merged {os.path.basename(loc_file)}: "
+                             f"{sum(len(v) for v in ns_dict.values())} translated / "
+                             f"{sum(len(v) for v in orig_dict.values())} total")
+                except Exception as merge_err:
+                    self.log(f"  ⚠ merge ไม่ได้ ({merge_err}) — ใช้คำแปลอย่างเดียว")
+                    lf = locres_mod.from_dict(ns_dict, version=3)
+            else:
+                lf = locres_mod.from_dict(ns_dict, version=3)
+                self.log(f"  {os.path.basename(loc_file)}: {sum(len(v) for v in ns_dict.values())} strings")
+
             raw = locres_mod.dump(lf, version=3)
-            patch_files[th_file] = raw
-            self.log(f"  {os.path.basename(th_file)}: {sum(len(v) for v in ns_dict.values())} strings")
+            patch_files[loc_file] = raw
 
         # Create _p.pak
         game_id   = self.game_name.lower().replace(" ", "_")
